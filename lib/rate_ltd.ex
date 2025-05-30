@@ -53,22 +53,23 @@ defmodule RateLtd do
     QueueConfig
   }
 
-  @type request_result :: 
-    {:ok, term()} | 
-    {:error, :timeout | :queue_full | :rate_limited | :invalid_config | {:function_error, term()}}
+  @type request_result ::
+          {:ok, term()}
+          | {:error,
+             :timeout | :queue_full | :rate_limited | :invalid_config | {:function_error, term()}}
 
-  @type async_result :: 
-    {:ok, term()} | 
-    {:queued, %{request_id: String.t(), estimated_wait_ms: non_neg_integer()}} | 
-    {:error, term()}
+  @type async_result ::
+          {:ok, term()}
+          | {:queued, %{request_id: String.t(), estimated_wait_ms: non_neg_integer()}}
+          | {:error, term()}
 
   @type check_result :: {:allow, non_neg_integer()} | {:deny, non_neg_integer()}
 
   @type status :: %{
-    rate_limit: map(),
-    queue: map(),
-    processor: map()
-  }
+          rate_limit: map(),
+          queue: map(),
+          processor: map()
+        }
 
   # Configuration API
 
@@ -132,11 +133,12 @@ defmodule RateLtd do
       end
   """
   @spec request(String.t(), function()) :: request_result()
-  @spec request(String.t(), function(), map() | RequestOptions.t()) :: request_result() | async_result()
+  @spec request(String.t(), function(), map() | RequestOptions.t()) ::
+          request_result() | async_result()
   def request(api_key, function, options \\ %{})
 
   def request(api_key, function, options) when is_map(options) do
-    options = 
+    options =
       if is_struct(options) do
         options
       else
@@ -146,7 +148,6 @@ defmodule RateLtd do
     with {:ok, validated_options} <- RequestOptions.validate(options),
          {:ok, rate_config} <- get_or_create_rate_config(api_key),
          {:ok, queue_config} <- get_or_create_queue_config(api_key) do
-
       if validated_options.async do
         request_async(api_key, function, validated_options, rate_config, queue_config)
       else
@@ -169,10 +170,10 @@ defmodule RateLtd do
 
   ## Example
       case RateLtd.check("external_api") do
-        {:allow, remaining} -> 
+        {:allow, remaining} ->
           # Make your call manually
           HTTPClient.get("/data")
-        {:deny, retry_after_ms} -> 
+        {:deny, retry_after_ms} ->
           # Wait or handle rate limit
           Process.sleep(retry_after_ms)
       end
@@ -182,6 +183,7 @@ defmodule RateLtd do
     case get_or_create_rate_config(api_key) do
       {:ok, rate_config} ->
         RateLimiter.check_rate(api_key, rate_config)
+
       {:error, _reason} ->
         # Default to allowing if no config
         {:allow, 1000}
@@ -204,13 +206,13 @@ defmodule RateLtd do
   """
   @spec get_status(String.t()) :: status()
   def get_status(api_key) do
-    rate_limit_status = 
+    rate_limit_status =
       case get_or_create_rate_config(api_key) do
         {:ok, rate_config} -> RateLimiter.get_status(api_key, rate_config)
         {:error, _} -> %{count: 0, remaining: 0, reset_at: DateTime.utc_now()}
       end
 
-    queue_status = 
+    queue_status =
       case get_or_create_queue_config(api_key) do
         {:ok, _queue_config} -> QueueManager.get_status("#{api_key}:queue")
         {:error, _} -> %{depth: 0, oldest_request_age_ms: 0}
@@ -229,9 +231,9 @@ defmodule RateLtd do
 
   defp request_blocking(api_key, function, options, rate_config, queue_config) do
     case attempt_immediate_execution(api_key, function, options, rate_config) do
-      {:ok, result} -> 
+      {:ok, result} ->
         {:ok, result}
-      
+
       {:retry_exhausted} ->
         # Queue the request and wait for completion
         queue_and_wait(api_key, function, options, queue_config)
@@ -240,9 +242,9 @@ defmodule RateLtd do
 
   defp request_async(api_key, function, options, rate_config, queue_config) do
     case attempt_immediate_execution(api_key, function, options, rate_config) do
-      {:ok, result} -> 
+      {:ok, result} ->
         {:ok, result}
-      
+
       {:retry_exhausted} ->
         # Queue the request for async processing
         queue_async(api_key, function, options, queue_config)
@@ -267,7 +269,7 @@ defmodule RateLtd do
         rescue
           error -> {:error, {:function_error, error}}
         end
-        
+
       {:deny, retry_after_ms} ->
         if retries_left > 0 and retry_after_ms < 1000 do
           # Short delay, retry immediately
@@ -281,31 +283,34 @@ defmodule RateLtd do
 
   defp queue_and_wait(api_key, function, options, queue_config) do
     queue_name = "#{api_key}:queue"
-    
-    request = QueuedRequest.new(queue_name, api_key, [
-      timeout_ms: options.timeout_ms,
-      priority: options.priority,
-      caller_pid: self(),
-      caller_ref: nil
-    ])
+
+    request =
+      QueuedRequest.new(queue_name, api_key,
+        timeout_ms: options.timeout_ms,
+        priority: options.priority,
+        caller_pid: self(),
+        caller_ref: nil
+      )
 
     case QueueManager.enqueue(request, queue_config) do
       {:queued, _request_id} ->
         request_id = request.id
+
         receive do
-          {:rate_ltd_execute, ^request_id} -> 
+          {:rate_ltd_execute, ^request_id} ->
             # QueueProcessor has allocated rate limit slot, now we execute
             try do
-              result = function.()
-              {:ok, result}
+              {:ok, function.()}
             rescue
               error -> {:error, {:function_error, error}}
             end
-          {:rate_ltd_expired, ^request_id, :timeout} -> {:error, :timeout}
+
+          {:rate_ltd_expired, ^request_id, :timeout} ->
+            {:error, :timeout}
         after
           options.timeout_ms -> {:error, :timeout}
         end
-        
+
       {:rejected, reason} ->
         {:error, reason}
     end
@@ -313,20 +318,21 @@ defmodule RateLtd do
 
   defp queue_async(api_key, _function, options, queue_config) do
     queue_name = "#{api_key}:queue"
-    
-    request = QueuedRequest.new(queue_name, api_key, [
-      timeout_ms: options.timeout_ms,
-      priority: options.priority,
-      caller_pid: self(),
-      caller_ref: nil
-    ])
+
+    request =
+      QueuedRequest.new(queue_name, api_key,
+        timeout_ms: options.timeout_ms,
+        priority: options.priority,
+        caller_pid: self(),
+        caller_ref: nil
+      )
 
     case QueueManager.enqueue(request, queue_config) do
       {:queued, request_id} ->
         # Estimate wait time based on queue depth and rate limit
         estimated_wait = estimate_wait_time(api_key, queue_config)
         {:queued, %{request_id: request_id, estimated_wait_ms: estimated_wait}}
-        
+
       {:rejected, reason} ->
         {:error, reason}
     end
@@ -338,27 +344,29 @@ defmodule RateLtd do
       {%{depth: depth}, {:ok, %{window_ms: window_ms, limit: limit}}} ->
         # Rough estimate: (queue_depth / rate_limit) * window_ms
         div(depth * window_ms, max(limit, 1))
-        
+
       _ ->
-        30_000 # Default 30 second estimate
+        # Default 30 second estimate
+        30_000
     end
   end
 
   defp get_or_create_rate_config(api_key) do
     case ConfigManager.get_rate_limit_config(api_key) do
-      {:ok, config} -> 
+      {:ok, config} ->
         {:ok, config}
-        
+
       {:error, :not_found} ->
         # Create default configuration
         defaults = Application.get_env(:rate_ltd, :defaults, [])
-        
-        config = RateLimitConfig.new(
-          api_key,
-          Keyword.get(defaults, :rate_limit, 100),
-          Keyword.get(defaults, :rate_limit_window_ms, 60_000)
-        )
-        
+
+        config =
+          RateLimitConfig.new(
+            api_key,
+            Keyword.get(defaults, :rate_limit, 100),
+            Keyword.get(defaults, :rate_limit_window_ms, 60_000)
+          )
+
         case ConfigManager.add_rate_limit_config(config) do
           :ok -> {:ok, config}
           error -> error
@@ -368,20 +376,21 @@ defmodule RateLtd do
 
   defp get_or_create_queue_config(api_key) do
     queue_name = "#{api_key}:queue"
-    
+
     case ConfigManager.get_queue_config(queue_name) do
-      {:ok, config} -> 
+      {:ok, config} ->
         {:ok, config}
-        
+
       {:error, :not_found} ->
         # Create default configuration
         defaults = Application.get_env(:rate_ltd, :defaults, [])
-        
-        config = QueueConfig.new(queue_name, [
-          max_size: Keyword.get(defaults, :max_queue_size, 1000),
-          request_timeout_ms: Keyword.get(defaults, :queue_timeout_ms, 300_000)
-        ])
-        
+
+        config =
+          QueueConfig.new(queue_name,
+            max_size: Keyword.get(defaults, :max_queue_size, 1000),
+            request_timeout_ms: Keyword.get(defaults, :queue_timeout_ms, 300_000)
+          )
+
         case ConfigManager.add_queue_config(config) do
           :ok -> {:ok, config}
           error -> error
