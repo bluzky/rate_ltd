@@ -80,6 +80,25 @@ queue_configs = [
 RateLtd.configure(rate_configs, queue_configs)
 ```
 
+## Architecture
+
+### Caller-Side Execution Model
+
+RateLtd uses an efficient **caller-side execution** architecture:
+
+1. **Rate Limit Check**: QueueProcessor checks if rate limit allows execution
+2. **Slot Allocation**: When allowed, rate limit counter is incremented (slot consumed)
+3. **Execution Signal**: QueueProcessor signals the waiting caller process
+4. **Caller Execution**: The original caller process executes its own function
+5. **Direct Results**: Results stay in caller's process context
+
+This design provides:
+- ✅ **Better Performance**: No function serialization overhead
+- ✅ **Natural Concurrency**: No artificial bottlenecks
+- ✅ **Simpler Architecture**: Less infrastructure code
+- ✅ **Error Locality**: Errors handled in caller's context
+- ✅ **Memory Efficiency**: Functions not stored in Redis
+
 ## Usage Examples
 
 ### Blocking Mode (Default)
@@ -115,12 +134,16 @@ end, %{async: true}) do
     # Request was queued
     IO.puts("Request queued, estimated wait: #{wait_time}ms")
     
-    # Wait for result
+    # Wait for execution signal
     receive do
-      {:rate_ltd_result, ^id, {:ok, result}} -> 
-        handle_response(result)
-      {:rate_ltd_result, ^id, {:error, reason}} -> 
-        handle_error(reason)
+      {:rate_ltd_execute, ^id} -> 
+        # Rate limit slot allocated, execute function
+        try do
+          result = HTTPClient.get("/data")
+          handle_response(result)
+        rescue
+          error -> handle_error(error)
+        end
       {:rate_ltd_expired, ^id, :timeout} -> 
         handle_timeout()
     after 
@@ -224,7 +247,8 @@ RateLtd emits telemetry events for monitoring:
 [:rate_ltd, :queue_manager, :request_rejected]
 
 # Queue processor events
-[:rate_ltd, :queue_processor, :request_executed]
+[:rate_ltd, :queue_processor, :request_signaled]
+[:rate_ltd, :queue_processor, :request_caller_unavailable]
 [:rate_ltd, :queue_processor, :processing_completed]
 ```
 

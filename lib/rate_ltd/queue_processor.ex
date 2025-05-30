@@ -227,7 +227,8 @@ defmodule RateLtd.QueueProcessor do
       {:ok, rate_config} ->
         case RateLimiter.check_rate(request.rate_limit_key, rate_config) do
           {:allow, _remaining} ->
-            execute_request(request)
+            # Rate limit slot allocated, signal caller to execute
+            signal_caller_to_execute(request)
             :processed
             
           {:deny, _retry_after} ->
@@ -235,43 +236,29 @@ defmodule RateLtd.QueueProcessor do
         end
         
       {:error, _reason} ->
-        # No configuration found, process the request anyway
-        execute_request(request)
+        # No configuration found, signal caller to execute anyway
+        signal_caller_to_execute(request)
         :processed
     end
   end
 
-  defp execute_request(%QueuedRequest{} = request) do
-    try do
-      result = request.function.()
-      send_result_to_caller(request, {:ok, result})
+  defp signal_caller_to_execute(%QueuedRequest{} = request) do
+    if request.caller_pid && Process.alive?(request.caller_pid) do
+      send(request.caller_pid, {:rate_ltd_execute, request.id})
       
-      emit_telemetry(:request_executed, %{
+      emit_telemetry(:request_signaled, %{
         request_id: request.id,
         queue_name: request.queue_name,
         rate_limit_key: request.rate_limit_key
       })
-      
-    rescue
-      error ->
-        send_result_to_caller(request, {:error, {:function_error, error}})
-        
-        emit_telemetry(:request_execution_failed, %{
-          request_id: request.id,
-          queue_name: request.queue_name,
-          error: inspect(error)
-        })
+    else
+      emit_telemetry(:request_caller_unavailable, %{
+        request_id: request.id,
+        queue_name: request.queue_name,
+        caller_alive: request.caller_pid && Process.alive?(request.caller_pid)
+      })
     end
   end
-
-  defp send_result_to_caller(%QueuedRequest{caller_pid: nil}, _result), do: :ok
-  defp send_result_to_caller(%QueuedRequest{caller_pid: pid, id: id}, result) 
-       when is_pid(pid) do
-    if Process.alive?(pid) do
-      send(pid, {:rate_ltd_result, id, result})
-    end
-  end
-  defp send_result_to_caller(_, _), do: :ok
 
   defp emit_telemetry(event, metadata) do
     :telemetry.execute([:rate_ltd, :queue_processor, event], %{}, metadata)

@@ -1,13 +1,13 @@
 defmodule RateLtd.QueuedRequest do
   @moduledoc """
-  Represents a queued request.
+  Represents a queued request placeholder.
+  The actual function is kept by the caller process.
   """
 
   @type t :: %__MODULE__{
     id: String.t(),
     queue_name: String.t(),
     rate_limit_key: String.t(),
-    function: function(),
     priority: pos_integer(),
     queued_at: DateTime.t(),
     expires_at: DateTime.t(),
@@ -18,15 +18,14 @@ defmodule RateLtd.QueuedRequest do
   defstruct id: nil,
             queue_name: nil,
             rate_limit_key: nil,
-            function: nil,
             priority: 1,
             queued_at: nil,
             expires_at: nil,
             caller_pid: nil,
             caller_ref: nil
 
-  @spec new(String.t(), String.t(), function(), keyword()) :: t()
-  def new(queue_name, rate_limit_key, function, opts \\ []) do
+  @spec new(String.t(), String.t(), keyword()) :: t()
+  def new(queue_name, rate_limit_key, opts \\ []) do
     now = DateTime.utc_now()
     timeout_ms = Keyword.get(opts, :timeout_ms, 300_000)
     expires_at = DateTime.add(now, timeout_ms, :millisecond)
@@ -35,7 +34,6 @@ defmodule RateLtd.QueuedRequest do
       id: UUID.uuid4(),
       queue_name: queue_name,
       rate_limit_key: rate_limit_key,
-      function: function,
       priority: Keyword.get(opts, :priority, 1),
       queued_at: now,
       expires_at: expires_at,
@@ -51,14 +49,10 @@ defmodule RateLtd.QueuedRequest do
 
   @spec serialize(t()) :: binary()
   def serialize(%__MODULE__{} = request) do
-    # We need to serialize the function as a term
-    function_binary = :erlang.term_to_binary(request.function)
-    
     data = %{
       id: request.id,
       queue_name: request.queue_name,
       rate_limit_key: request.rate_limit_key,
-      function: Base.encode64(function_binary),
       priority: request.priority,
       queued_at: DateTime.to_iso8601(request.queued_at),
       expires_at: DateTime.to_iso8601(request.expires_at),
@@ -72,7 +66,6 @@ defmodule RateLtd.QueuedRequest do
   @spec deserialize(binary()) :: {:ok, t()} | {:error, term()}
   def deserialize(binary) when is_binary(binary) do
     with {:ok, data} <- Jason.decode(binary),
-         {:ok, function} <- decode_function(data["function"]),
          {:ok, queued_at, _offset} <- DateTime.from_iso8601(data["queued_at"]),
          {:ok, expires_at, _offset} <- DateTime.from_iso8601(data["expires_at"]) do
       
@@ -80,7 +73,6 @@ defmodule RateLtd.QueuedRequest do
         id: data["id"],
         queue_name: data["queue_name"],
         rate_limit_key: data["rate_limit_key"],
-        function: function,
         priority: data["priority"],
         queued_at: queued_at,
         expires_at: expires_at,
@@ -91,18 +83,6 @@ defmodule RateLtd.QueuedRequest do
       {:ok, request}
     else
       error -> {:error, error}
-    end
-  end
-
-  defp decode_function(nil), do: {:error, :missing_function}
-  defp decode_function(encoded) do
-    try do
-      encoded
-      |> Base.decode64!()
-      |> :erlang.binary_to_term()
-      |> then(&{:ok, &1})
-    rescue
-      _ -> {:error, :invalid_function}
     end
   end
 

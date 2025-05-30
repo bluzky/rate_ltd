@@ -282,7 +282,7 @@ defmodule RateLtd do
   defp queue_and_wait(api_key, function, options, queue_config) do
     queue_name = "#{api_key}:queue"
     
-    request = QueuedRequest.new(queue_name, api_key, function, [
+    request = QueuedRequest.new(queue_name, api_key, [
       timeout_ms: options.timeout_ms,
       priority: options.priority,
       caller_pid: self(),
@@ -293,7 +293,14 @@ defmodule RateLtd do
       {:queued, _request_id} ->
         request_id = request.id
         receive do
-          {:rate_ltd_result, ^request_id, result} -> result
+          {:rate_ltd_execute, ^request_id} -> 
+            # QueueProcessor has allocated rate limit slot, now we execute
+            try do
+              result = function.()
+              {:ok, result}
+            rescue
+              error -> {:error, {:function_error, error}}
+            end
           {:rate_ltd_expired, ^request_id, :timeout} -> {:error, :timeout}
         after
           options.timeout_ms -> {:error, :timeout}
@@ -304,10 +311,10 @@ defmodule RateLtd do
     end
   end
 
-  defp queue_async(api_key, function, options, queue_config) do
+  defp queue_async(api_key, _function, options, queue_config) do
     queue_name = "#{api_key}:queue"
     
-    request = QueuedRequest.new(queue_name, api_key, function, [
+    request = QueuedRequest.new(queue_name, api_key, [
       timeout_ms: options.timeout_ms,
       priority: options.priority,
       caller_pid: self(),

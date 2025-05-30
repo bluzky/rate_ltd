@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - BREAKING
+- **Major Architecture Improvement**: Switched to caller-side execution model
+  - QueueProcessor now signals callers to execute instead of executing functions itself
+  - Eliminates function serialization overhead
+  - Provides better performance and natural concurrency
+  - Functions no longer stored in Redis, reducing memory usage
+  - Error handling remains in caller's process context
+- **Updated Message Protocol**: Changed from `{:rate_ltd_result, id, result}` to `{:rate_ltd_execute, id}`
+- **Simplified QueuedRequest**: Removed function storage from request structure
+- **Updated Telemetry Events**: 
+  - Removed `:request_executed` and `:request_execution_failed`
+  - Added `:request_signaled` and `:request_caller_unavailable`
+
+### Benefits
+- 🚀 **Improved Performance**: No serialization/deserialization of functions
+- 📈 **Better Scalability**: No single bottleneck for function execution  
+- 🧠 **Reduced Memory**: Functions not stored in Redis queues
+- 🔧 **Simpler Code**: Less infrastructure for function handling
+- ⚡ **Natural Concurrency**: Multiple requests execute in parallel when rate limits allow
+
 ## [0.1.0] - 2025-05-30
 
 ### Added

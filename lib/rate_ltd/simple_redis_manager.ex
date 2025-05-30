@@ -55,7 +55,7 @@ defmodule RateLtd.SimpleRedisManager do
   end
 
   @impl true
-  def handle_call({:command, command}, _from, %{conn: nil} = state) do
+  def handle_call({:command, _command}, _from, %{conn: nil} = state) do
     # Redis not available (test mode)
     {:reply, {:error, :redis_unavailable}, state}
   end
@@ -65,7 +65,7 @@ defmodule RateLtd.SimpleRedisManager do
     {:reply, result, state}
   end
 
-  def handle_call({:pipeline, commands}, _from, %{conn: nil} = state) do
+  def handle_call({:pipeline, _commands}, _from, %{conn: nil} = state) do
     {:reply, {:error, :redis_unavailable}, state}
   end
 
