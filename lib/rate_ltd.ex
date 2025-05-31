@@ -14,8 +14,8 @@ defmodule RateLtd do
       ]
 
       queue_configs = [
-        RateLtd.QueueConfig.new("api:queue", max_size: 1000),
-        RateLtd.QueueConfig.new("external_api:queue", max_size: 500)
+        RateLtd.QueueConfig.new(%{name: "api:queue", max_size: 1000}),
+        RateLtd.QueueConfig.new(%{name: "external_api:queue", max_size: 500})
       ]
 
       RateLtd.configure(rate_configs, queue_configs)
@@ -87,8 +87,8 @@ defmodule RateLtd do
       ]
 
       queue_configs = [
-        RateLtd.QueueConfig.new("api:queue", max_size: 1000),
-        RateLtd.QueueConfig.new("external_api:queue", max_size: 500)
+        RateLtd.QueueConfig.new(%{name: "api:queue", max_size: 1000}),
+        RateLtd.QueueConfig.new(%{name: "external_api:queue", max_size: 500})
       ]
 
       RateLtd.configure(rate_configs, queue_configs)
@@ -142,10 +142,10 @@ defmodule RateLtd do
       if is_struct(options) do
         options
       else
-        RequestOptions.new(Map.to_list(options))
+        RequestOptions.from_opts(Map.to_list(options))
       end
 
-    with {:ok, validated_options} <- RequestOptions.validate(options),
+    with {:ok, validated_options} <- Skema.cast_and_validate(RequestOptions, options),
          {:ok, rate_config} <- get_or_create_rate_config(api_key),
          {:ok, queue_config} <- get_or_create_queue_config(api_key) do
       if validated_options.async do
@@ -331,6 +331,8 @@ defmodule RateLtd do
       {:queued, request_id} ->
         # Estimate wait time based on queue depth and rate limit
         estimated_wait = estimate_wait_time(api_key, queue_config)
+        # Return immediately - caller will receive {:rate_ltd_execute, request_id} message later
+        # and must handle the execution themselves
         {:queued, %{request_id: request_id, estimated_wait_ms: estimated_wait}}
 
       {:rejected, reason} ->
@@ -386,10 +388,22 @@ defmodule RateLtd do
         defaults = Application.get_env(:rate_ltd, :defaults, [])
 
         config =
-          QueueConfig.new(queue_name,
+          case Skema.cast_and_validate(QueueConfig, %{
+            name: queue_name,
             max_size: Keyword.get(defaults, :max_queue_size, 1000),
             request_timeout_ms: Keyword.get(defaults, :queue_timeout_ms, 300_000)
-          )
+          }) do
+            {:ok, valid_config} -> valid_config
+            {:error, _} ->
+              # Fallback
+              %QueueConfig{
+                name: queue_name,
+                max_size: Keyword.get(defaults, :max_queue_size, 1000),
+                request_timeout_ms: Keyword.get(defaults, :queue_timeout_ms, 300_000),
+                enable_priority: false,
+                overflow_strategy: :reject
+              }
+          end
 
         case ConfigManager.add_queue_config(config) do
           :ok -> {:ok, config}

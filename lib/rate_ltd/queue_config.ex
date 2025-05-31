@@ -1,54 +1,45 @@
 defmodule RateLtd.QueueConfig do
   @moduledoc """
-  Configuration for queue management.
+  Configuration for queue management using Skema validation.
   """
+
+  use Skema
 
   @type overflow_strategy :: :reject | :drop_oldest
 
-  @type t :: %__MODULE__{
-    name: String.t(),
-    max_size: pos_integer(),
-    request_timeout_ms: pos_integer(),
-    enable_priority: boolean(),
-    overflow_strategy: overflow_strategy()
-  }
-
-  defstruct name: nil,
-            max_size: 1000,
-            request_timeout_ms: 300_000,
-            enable_priority: false,
-            overflow_strategy: :reject
-
-  @spec new(String.t(), keyword()) :: t()
-  def new(name, opts \\ []) do
-    %__MODULE__{
-      name: name,
-      max_size: Keyword.get(opts, :max_size, 1000),
-      request_timeout_ms: Keyword.get(opts, :request_timeout_ms, 300_000),
-      enable_priority: Keyword.get(opts, :enable_priority, false),
-      overflow_strategy: Keyword.get(opts, :overflow_strategy, :reject)
-    }
+  defschema do
+    field :name, :string, required: true, string: [min_length: 1]
+    field :max_size, :integer, required: true, default: 1000, number: [min: 1]
+    field :request_timeout_ms, :integer, required: true, default: 300_000, number: [min: 1]
+    field :enable_priority, :boolean, required: true, default: false
+    field :overflow_strategy, :atom, required: true, default: :reject, enum: [:reject, :drop_oldest]
   end
 
-  @spec validate(t()) :: {:ok, t()} | {:error, term()}
-  def validate(%__MODULE__{} = config) do
-    with :ok <- validate_name(config.name),
-         :ok <- validate_max_size(config.max_size),
-         :ok <- validate_request_timeout_ms(config.request_timeout_ms),
-         :ok <- validate_overflow_strategy(config.overflow_strategy) do
-      {:ok, config}
+  @doc """
+  Create new QueueConfig with name and options.
+  
+  ## Examples
+      iex> QueueConfig.from_name_and_opts("test_queue", max_size: 500, enable_priority: true)
+      %QueueConfig{name: "test_queue", max_size: 500, enable_priority: true, ...}
+  """
+  @spec from_name_and_opts(String.t(), keyword()) :: t()
+  def from_name_and_opts(name, opts \\ []) do
+    params = 
+      opts
+      |> Keyword.put(:name, name)
+      |> Enum.into(%{})
+
+    case Skema.cast_and_validate(__MODULE__, params) do
+      {:ok, config} -> config
+      {:error, _error} -> 
+        # Fallback to manual construction for backwards compatibility
+        %__MODULE__{
+          name: name,
+          max_size: Keyword.get(opts, :max_size, 1000),
+          request_timeout_ms: Keyword.get(opts, :request_timeout_ms, 300_000),
+          enable_priority: Keyword.get(opts, :enable_priority, false),
+          overflow_strategy: Keyword.get(opts, :overflow_strategy, :reject)
+        }
     end
   end
-
-  defp validate_name(name) when is_binary(name) and byte_size(name) > 0, do: :ok
-  defp validate_name(_), do: {:error, :invalid_name}
-
-  defp validate_max_size(max_size) when is_integer(max_size) and max_size > 0, do: :ok
-  defp validate_max_size(_), do: {:error, :invalid_max_size}
-
-  defp validate_request_timeout_ms(timeout) when is_integer(timeout) and timeout > 0, do: :ok
-  defp validate_request_timeout_ms(_), do: {:error, :invalid_request_timeout_ms}
-
-  defp validate_overflow_strategy(strategy) when strategy in [:reject, :drop_oldest], do: :ok
-  defp validate_overflow_strategy(_), do: {:error, :invalid_overflow_strategy}
 end

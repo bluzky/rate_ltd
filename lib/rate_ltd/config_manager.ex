@@ -99,7 +99,7 @@ defmodule RateLtd.ConfigManager do
 
   @impl true
   def handle_call({:add_rate_limit_config, config}, _from, state) do
-    case RateLimitConfig.validate(config) do
+    case Skema.cast_and_validate(RateLimitConfig, config) do
       {:ok, validated_config} ->
         new_rate_configs = Map.put(state.rate_configs, validated_config.key, validated_config)
         new_state = %{state | rate_configs: new_rate_configs}
@@ -112,7 +112,7 @@ defmodule RateLtd.ConfigManager do
 
   @impl true
   def handle_call({:add_queue_config, config}, _from, state) do
-    case QueueConfig.validate(config) do
+    case Skema.cast_and_validate(QueueConfig, config) do
       {:ok, validated_config} ->
         new_queue_configs = Map.put(state.queue_configs, validated_config.name, validated_config)
         new_state = %{state | queue_configs: new_queue_configs}
@@ -195,7 +195,7 @@ defmodule RateLtd.ConfigManager do
     validated = 
       configs
       |> Enum.map(&ensure_rate_limit_config/1)
-      |> Enum.map(&RateLimitConfig.validate/1)
+      |> Enum.map(&Skema.cast_and_validate(RateLimitConfig, &1))
       |> Enum.reduce_while([], fn
         {:ok, config}, acc -> {:cont, [config | acc]}
         {:error, reason}, _acc -> {:halt, {:error, reason}}
@@ -211,7 +211,7 @@ defmodule RateLtd.ConfigManager do
     validated = 
       configs
       |> Enum.map(&ensure_queue_config/1)
-      |> Enum.map(&QueueConfig.validate/1)
+      |> Enum.map(&Skema.cast_and_validate(QueueConfig, &1))
       |> Enum.reduce_while([], fn
         {:ok, config}, acc -> {:cont, [config | acc]}
         {:error, reason}, _acc -> {:halt, {:error, reason}}
@@ -225,7 +225,7 @@ defmodule RateLtd.ConfigManager do
 
   defp ensure_rate_limit_config(%RateLimitConfig{} = config), do: config
   defp ensure_rate_limit_config({key, opts}) when is_binary(key) and is_list(opts) do
-    %RateLimitConfig{
+    %{
       key: key,
       limit: Keyword.get(opts, :limit, 100),
       window_ms: Keyword.get(opts, :window_ms, 60_000),
@@ -233,14 +233,16 @@ defmodule RateLtd.ConfigManager do
     }
   end
   defp ensure_rate_limit_config(config) when is_map(config) do
-    struct(RateLimitConfig, config)
+    config
   end
 
   defp ensure_queue_config(%QueueConfig{} = config), do: config
   defp ensure_queue_config({name, opts}) when is_binary(name) and is_list(opts) do
-    QueueConfig.new(name, opts)
+    opts
+    |> Keyword.put(:name, name)
+    |> Enum.into(%{})
   end
   defp ensure_queue_config(config) when is_map(config) do
-    struct(QueueConfig, config)
+    config
   end
 end

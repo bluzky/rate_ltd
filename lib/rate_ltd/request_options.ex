@@ -1,45 +1,38 @@
 defmodule RateLtd.RequestOptions do
   @moduledoc """
-  Options for rate limited requests.
+  Options for rate limited requests using Skema validation.
   """
 
-  @type t :: %__MODULE__{
-    timeout_ms: pos_integer(),
-    priority: pos_integer(),
-    async: boolean(),
-    max_retries: non_neg_integer()
-  }
+  use Skema
 
-  defstruct timeout_ms: 30_000,
-            priority: 1,
-            async: false,
-            max_retries: 3
-
-  @spec new(keyword()) :: t()
-  def new(opts \\ []) do
-    %__MODULE__{
-      timeout_ms: Keyword.get(opts, :timeout_ms, 30_000),
-      priority: Keyword.get(opts, :priority, 1),
-      async: Keyword.get(opts, :async, false),
-      max_retries: Keyword.get(opts, :max_retries, 3)
-    }
+  defschema do
+    field :timeout_ms, :integer, required: true, default: 30_000, number: [min: 1]
+    field :priority, :integer, required: true, default: 1, number: [min: 1]
+    field :async, :boolean, required: true, default: false
+    field :max_retries, :integer, required: true, default: 3, number: [min: 0]
   end
 
-  @spec validate(t()) :: {:ok, t()} | {:error, term()}
-  def validate(%__MODULE__{} = options) do
-    with :ok <- validate_timeout_ms(options.timeout_ms),
-         :ok <- validate_priority(options.priority),
-         :ok <- validate_max_retries(options.max_retries) do
-      {:ok, options}
+  @doc """
+  Create new RequestOptions from keyword list.
+  
+  ## Examples
+      iex> RequestOptions.from_opts(timeout_ms: 60_000, async: true)
+      %RequestOptions{timeout_ms: 60_000, async: true, priority: 1, max_retries: 3}
+  """
+  @spec from_opts(keyword()) :: t()
+  def from_opts(opts \\ []) do
+    params = Enum.into(opts, %{})
+
+    case Skema.cast_and_validate(__MODULE__, params) do
+      {:ok, options} -> options
+      {:error, _error} ->
+        # Fallback to manual construction for backwards compatibility
+        %__MODULE__{
+          timeout_ms: Keyword.get(opts, :timeout_ms, 30_000),
+          priority: Keyword.get(opts, :priority, 1),
+          async: Keyword.get(opts, :async, false),
+          max_retries: Keyword.get(opts, :max_retries, 3)
+        }
     end
   end
-
-  defp validate_timeout_ms(timeout) when is_integer(timeout) and timeout > 0, do: :ok
-  defp validate_timeout_ms(_), do: {:error, :invalid_timeout_ms}
-
-  defp validate_priority(priority) when is_integer(priority) and priority > 0, do: :ok
-  defp validate_priority(_), do: {:error, :invalid_priority}
-
-  defp validate_max_retries(retries) when is_integer(retries) and retries >= 0, do: :ok
-  defp validate_max_retries(_), do: {:error, :invalid_max_retries}
 end

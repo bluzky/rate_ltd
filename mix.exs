@@ -27,6 +27,7 @@ defmodule RateLtd.MixProject do
       {:jason, "~> 1.4", optional: true},
       {:uuid, "~> 1.1"},
       {:telemetry, "~> 1.2", optional: true},
+      {:skema, "~> 0.2"},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}

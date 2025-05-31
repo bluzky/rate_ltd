@@ -1,36 +1,32 @@
 defmodule RateLtd.QueuedRequest do
   @moduledoc """
-  Represents a queued request placeholder.
+  Represents a queued request placeholder using Skema validation.
   The actual function is kept by the caller process.
   """
 
-  @type t :: %__MODULE__{
-    id: String.t(),
-    queue_name: String.t(),
-    rate_limit_key: String.t(),
-    priority: pos_integer(),
-    queued_at: DateTime.t(),
-    expires_at: DateTime.t(),
-    caller_pid: pid() | nil,
-    caller_ref: reference() | nil
-  }
+  use Skema
 
-  defstruct id: nil,
-            queue_name: nil,
-            rate_limit_key: nil,
-            priority: 1,
-            queued_at: nil,
-            expires_at: nil,
-            caller_pid: nil,
-            caller_ref: nil
+  defschema do
+    field :id, :string, required: true, string: [min_length: 1]
+    field :queue_name, :string, required: true, string: [min_length: 1]
+    field :rate_limit_key, :string, required: true, string: [min_length: 1]
+    field :priority, :integer, required: true, default: 1, number: [min: 1]
+    field :queued_at, :utc_datetime, required: true
+    field :expires_at, :utc_datetime, required: true
+    field :caller_pid, :any, required: false
+    field :caller_ref, :any, required: false
+  end
 
+  # Function header with default arguments
   @spec new(String.t(), String.t(), keyword()) :: t()
-  def new(queue_name, rate_limit_key, opts \\ []) do
+  def new(queue_name, rate_limit_key, opts \\ [])
+
+  def new(queue_name, rate_limit_key, opts) do
     now = DateTime.utc_now()
     timeout_ms = Keyword.get(opts, :timeout_ms, 300_000)
     expires_at = DateTime.add(now, timeout_ms, :millisecond)
 
-    %__MODULE__{
+    params = %{
       id: UUID.uuid4(),
       queue_name: queue_name,
       rate_limit_key: rate_limit_key,
@@ -40,6 +36,13 @@ defmodule RateLtd.QueuedRequest do
       caller_pid: Keyword.get(opts, :caller_pid),
       caller_ref: Keyword.get(opts, :caller_ref)
     }
+
+    case Skema.cast_and_validate(__MODULE__, params) do
+      {:ok, request} -> request
+      {:error, _error} ->
+        # Fallback to manual construction
+        struct!(__MODULE__, params)
+    end
   end
 
   @spec expired?(t()) :: boolean()
@@ -59,7 +62,7 @@ defmodule RateLtd.QueuedRequest do
       caller_pid: if(request.caller_pid, do: :erlang.term_to_binary(request.caller_pid) |> Base.encode64()),
       caller_ref: if(request.caller_ref, do: :erlang.term_to_binary(request.caller_ref) |> Base.encode64())
     }
-    
+
     Jason.encode!(data)
   end
 
@@ -68,8 +71,8 @@ defmodule RateLtd.QueuedRequest do
     with {:ok, data} <- Jason.decode(binary),
          {:ok, queued_at, _offset} <- DateTime.from_iso8601(data["queued_at"]),
          {:ok, expires_at, _offset} <- DateTime.from_iso8601(data["expires_at"]) do
-      
-      request = %__MODULE__{
+
+      params = %{
         id: data["id"],
         queue_name: data["queue_name"],
         rate_limit_key: data["rate_limit_key"],
@@ -79,8 +82,11 @@ defmodule RateLtd.QueuedRequest do
         caller_pid: decode_pid(data["caller_pid"]),
         caller_ref: decode_ref(data["caller_ref"])
       }
-      
-      {:ok, request}
+
+      case Skema.cast_and_validate(__MODULE__, params) do
+        {:ok, request} -> {:ok, request}
+        {:error, reason} -> {:error, reason}
+      end
     else
       error -> {:error, error}
     end

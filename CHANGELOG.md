@@ -20,12 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Removed `:request_executed` and `:request_execution_failed`
   - Added `:request_signaled` and `:request_caller_unavailable`
 
+### Added
+- **Skema Integration**: All configuration structs now use Skema for validation
+  - Built-in validators for min/max values, string length, enums
+  - Cleaner schema definitions with declarative field constraints
+  - Better error messages with detailed changesets
+  - Automatic type casting and validation in one step
+- **Enhanced Validation**: More robust input validation across all components
+
 ### Benefits
 - 🚀 **Improved Performance**: No serialization/deserialization of functions
 - 📈 **Better Scalability**: No single bottleneck for function execution  
 - 🧠 **Reduced Memory**: Functions not stored in Redis queues
 - 🔧 **Simpler Code**: Less infrastructure for function handling
 - ⚡ **Natural Concurrency**: Multiple requests execute in parallel when rate limits allow
+- ✅ **Better Validation**: Declarative schema validation with Skema
 
 ## [0.1.0] - 2025-05-30
 
