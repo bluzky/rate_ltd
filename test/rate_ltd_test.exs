@@ -3,6 +3,12 @@ defmodule RateLtdTest do
   use ExUnit.Case, async: false
 
   setup do
+    # Stop any existing QueueProcessor
+    case Process.whereis(RateLtd.QueueProcessor) do
+      nil -> :ok
+      pid -> GenServer.stop(pid, :normal, 1000)
+    end
+
     # Start mock Redis
     start_supervised!(MockRedis)
 
@@ -16,7 +22,8 @@ defmodule RateLtdTest do
     Application.put_env(:rate_ltd, :defaults, limit: 5, window_ms: 1000, max_queue_size: 3)
 
     Application.put_env(:rate_ltd, :configs, %{
-      "test_api" => %{limit: 2, window_ms: 1000, max_queue_size: 2}
+      "test_api" => %{limit: 2, window_ms: 1000, max_queue_size: 2},
+      "timeout_test" => %{limit: 1, window_ms: 1000, max_queue_size: 1}
     })
 
     :ok
@@ -59,9 +66,16 @@ defmodule RateLtdTest do
 
   describe "request/3 with options" do
     test "respects timeout option" do
+      # Force the rate limit to be exceeded by making the mock always deny
+      # We'll create a mock that always returns deny for this specific key
+
+      # First, exhaust the rate limit for timeout_test (limit: 1)
+      assert {:ok, "first"} = RateLtd.request("timeout_test", fn -> "first" end)
+
+      # Now this request should be rate limited and queue, then timeout
       task =
         Task.async(fn ->
-          RateLtd.request("nonexistent_queue", fn -> "test" end, timeout_ms: 50)
+          RateLtd.request("timeout_test", fn -> "test" end, timeout_ms: 50)
         end)
 
       result = Task.await(task)
