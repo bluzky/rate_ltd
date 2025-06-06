@@ -1,5 +1,8 @@
 import Config
 
+# Ensure telemetry starts in test environment
+config :telemetry, :enabled, true
+
 # Test configuration - use different Redis database
 config :rate_ltd, :redis,
   host: "localhost",

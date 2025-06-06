@@ -1,266 +1,99 @@
+# lib/rate_ltd/queue_processor.ex
 defmodule RateLtd.QueueProcessor do
   @moduledoc """
-  Background process that moves ready requests from queue back to rate limiter.
+  Minimal queue processor that signals waiting processes.
   """
-
   use GenServer
-  alias RateLtd.{QueueManager, RateLimiter, ConfigManager, QueuedRequest}
-  require Logger
 
-  @default_config [
-    polling_interval_ms: 1_000,
-    batch_size: 100,
-    enable_cleanup: true
-  ]
-
-  defstruct [
-    :config,
-    :timer_ref,
-    :stats
-  ]
-
-  def start_link(config \\ []) do
-    GenServer.start_link(__MODULE__, config, name: __MODULE__)
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
-  @spec get_status() :: %{
-    queues_processed: non_neg_integer(),
-    last_run: DateTime.t() | nil,
-    active: boolean(),
-    stats: map()
-  }
-  def get_status do
-    GenServer.call(__MODULE__, :get_status)
+  def init(_) do
+    schedule_check()
+    {:ok, %{}}
   end
 
-  @spec pause() :: :ok
-  def pause do
-    GenServer.call(__MODULE__, :pause)
-  end
-
-  @spec resume() :: :ok
-  def resume do
-    GenServer.call(__MODULE__, :resume)
-  end
-
-  @impl true
-  def init(config) do
-    config = Keyword.merge(@default_config, config)
-    
-    state = %__MODULE__{
-      config: config,
-      timer_ref: nil,
-      stats: %{
-        queues_processed: 0,
-        requests_processed: 0,
-        last_run: nil,
-        errors: 0,
-        active: true
-      }
-    }
-    
-    # Start processing immediately
-    {:ok, schedule_next_run(state)}
-  end
-
-  @impl true
-  def handle_call(:get_status, _from, state) do
-    status = %{
-      queues_processed: state.stats.queues_processed,
-      last_run: state.stats.last_run,
-      active: state.stats.active,
-      stats: state.stats
-    }
-    
-    {:reply, status, state}
-  end
-
-  @impl true
-  def handle_call(:pause, _from, state) do
-    state = 
-      state
-      |> cancel_timer()
-      |> put_in([:stats, :active], false)
-    
-    Logger.info("Queue processor paused")
-    {:reply, :ok, state}
-  end
-
-  @impl true
-  def handle_call(:resume, _from, state) do
-    state = 
-      state
-      |> put_in([:stats, :active], true)
-      |> schedule_next_run()
-    
-    Logger.info("Queue processor resumed")
-    {:reply, :ok, state}
-  end
-
-  @impl true
-  def handle_info(:process_queues, state) do
-    if state.stats.active do
-      state = process_all_queues(state)
-      {:noreply, schedule_next_run(state)}
-    else
-      {:noreply, state}
-    end
-  end
-
-  @impl true
-  def handle_info(_msg, state) do
+  def handle_info(:check_queues, state) do
+    process_ready_requests()
+    schedule_check()
     {:noreply, state}
   end
 
-  @impl true
-  def terminate(_reason, state) do
-    cancel_timer(state)
-    :ok
+  defp schedule_check do
+    # Check every 2 seconds
+    Process.send_after(self(), :check_queues, 2000)
   end
 
-  defp schedule_next_run(state) do
-    timer_ref = Process.send_after(self(), :process_queues, state.config[:polling_interval_ms])
-    %{state | timer_ref: timer_ref}
+  defp process_ready_requests do
+    RateLtd.Queue.list_active_queues()
+    |> Enum.each(&try_process_queue/1)
   end
 
-  defp cancel_timer(%{timer_ref: nil} = state), do: state
-  defp cancel_timer(%{timer_ref: timer_ref} = state) do
-    Process.cancel_timer(timer_ref)
-    %{state | timer_ref: nil}
-  end
-
-  defp process_all_queues(state) do
-    start_time = System.monotonic_time(:millisecond)
-    
-    try do
-      case QueueManager.list_queues() do
-        {:ok, queue_names} ->
-          {processed_count, errors} = process_queues(queue_names)
-          
-          new_stats = %{
-            state.stats |
-            queues_processed: state.stats.queues_processed + length(queue_names),
-            requests_processed: state.stats.requests_processed + processed_count,
-            errors: state.stats.errors + errors,
-            last_run: DateTime.utc_now()
-          }
-          
-          emit_telemetry(:processing_completed, %{
-            duration_ms: System.monotonic_time(:millisecond) - start_time,
-            queues_count: length(queue_names),
-            requests_processed: processed_count,
-            errors: errors
-          })
-          
-          %{state | stats: new_stats}
-      end
-    rescue
-      error ->
-        Logger.error("Queue processing failed: #{inspect(error)}")
-        
-        new_stats = %{
-          state.stats |
-          errors: state.stats.errors + 1,
-          last_run: DateTime.utc_now()
-        }
-        
-        %{state | stats: new_stats}
-    end
-  end
-
-  defp process_queues(queue_names) do
-    {processed_count, errors} = 
-      queue_names
-      |> Enum.reduce({0, 0}, fn queue_name, {processed_acc, errors_acc} ->
-        case process_single_queue(queue_name) do
-          {:ok, count} -> {processed_acc + count, errors_acc}
-          {:error, _reason} -> {processed_acc, errors_acc + 1}
-        end
-      end)
-    
-    # Cleanup expired requests if enabled
-    if Application.get_env(:rate_ltd, :processor, [])[:enable_cleanup] do
-      Enum.each(queue_names, &QueueManager.cleanup_expired/1)
-    end
-    
-    {processed_count, errors}
-  end
-
-  defp process_single_queue(queue_name) do
-    try do
-      count = process_queue_requests(queue_name, 0)
-      {:ok, count}
-    rescue
-      error ->
-        Logger.error("Failed to process queue #{queue_name}: #{inspect(error)}")
-        {:error, error}
-    end
-  end
-
-  defp process_queue_requests(queue_name, processed_count) do
-    case QueueManager.peek_next(queue_name) do
-      {:empty} ->
-        processed_count
-        
-      {:ok, %QueuedRequest{} = request} ->
-        if QueuedRequest.expired?(request) do
-          # Remove expired request and continue
-          QueueManager.dequeue(queue_name)
-          process_queue_requests(queue_name, processed_count)
+  defp try_process_queue(queue_name) do
+    case RateLtd.Queue.peek_next(queue_name) do
+      {:ok, request} ->
+        if request_expired?(request) do
+          # Remove expired request
+          RateLtd.Queue.dequeue(queue_name)
+          # Try next request
+          try_process_queue(queue_name)
         else
-          case try_process_request(request) do
-            :processed ->
-              # Request was processed, remove from queue and continue
-              QueueManager.dequeue(queue_name)
-              process_queue_requests(queue_name, processed_count + 1)
-              
-            :rate_limited ->
-              # Still rate limited, leave in queue and stop processing this queue
-              processed_count
+          # Check if rate limit allows
+          config = get_config(request["rate_limit_key"])
+
+          case RateLtd.Limiter.check_rate(request["rate_limit_key"], config) do
+            {:allow, _remaining} ->
+              # Signal the waiting process
+              caller_pid = :erlang.binary_to_term(Base.decode64!(request["caller_pid"]))
+
+              if Process.alive?(caller_pid) do
+                send(caller_pid, {:rate_ltd_execute, request["id"]})
+                RateLtd.Queue.dequeue(queue_name)
+                # Try next request
+                try_process_queue(queue_name)
+              else
+                # Dead process, remove request
+                RateLtd.Queue.dequeue(queue_name)
+                try_process_queue(queue_name)
+              end
+
+            {:deny, _retry_after} ->
+              # Still rate limited, leave in queue
+              :ok
           end
         end
+
+      {:empty} ->
+        :ok
+
+      {:error, _} ->
+        :ok
     end
   end
 
-  defp try_process_request(%QueuedRequest{} = request) do
-    case ConfigManager.get_rate_limit_config(request.rate_limit_key) do
-      {:ok, rate_config} ->
-        case RateLimiter.check_rate(request.rate_limit_key, rate_config) do
-          {:allow, _remaining} ->
-            # Rate limit slot allocated, signal caller to execute
-            signal_caller_to_execute(request)
-            :processed
-            
-          {:deny, _retry_after} ->
-            :rate_limited
-        end
-        
-      {:error, _reason} ->
-        # No configuration found, signal caller to execute anyway
-        signal_caller_to_execute(request)
-        :processed
-    end
+  defp request_expired?(request) do
+    now = System.system_time(:millisecond)
+    expires_at = request["expires_at"]
+    now > expires_at
   end
 
-  defp signal_caller_to_execute(%QueuedRequest{} = request) do
-    if request.caller_pid && Process.alive?(request.caller_pid) do
-      send(request.caller_pid, {:rate_ltd_execute, request.id})
-      
-      emit_telemetry(:request_signaled, %{
-        request_id: request.id,
-        queue_name: request.queue_name,
-        rate_limit_key: request.rate_limit_key
-      })
-    else
-      emit_telemetry(:request_caller_unavailable, %{
-        request_id: request.id,
-        queue_name: request.queue_name,
-        caller_alive: request.caller_pid && Process.alive?(request.caller_pid)
-      })
-    end
-  end
+  defp get_config(key) do
+    defaults = Application.get_env(:rate_ltd, :defaults, [])
+    custom_configs = Application.get_env(:rate_ltd, :configs, %{})
 
-  defp emit_telemetry(event, metadata) do
-    :telemetry.execute([:rate_ltd, :queue_processor, event], %{}, metadata)
+    case Map.get(custom_configs, key) do
+      nil ->
+        %{
+          limit: Keyword.get(defaults, :limit, 100),
+          window_ms: Keyword.get(defaults, :window_ms, 60_000)
+        }
+
+      config when is_map(config) ->
+        config
+
+      {limit, window_ms} ->
+        %{limit: limit, window_ms: window_ms}
+    end
   end
 end
