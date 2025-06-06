@@ -4,14 +4,12 @@ A distributed rate limiting library for Elixir applications with Redis backend a
 
 ## Features
 
-- **Distributed Rate Limiting**: Accurate rate limiting across multiple nodes using Redis
-- **Multiple Algorithms**: Sliding window, fixed window, and token bucket algorithms
-- **Request Queueing**: Automatic queueing when rate limits are exceeded
-- **Background Processing**: Simple queue processor for handling queued requests
-- **Priority Support**: Optional priority levels for queue processing
-- **Graceful Degradation**: Continues operating when Redis is unavailable
-- **Telemetry Integration**: Built-in metrics and observability
-- **Flexible Configuration**: Runtime configuration with sensible defaults
+- **Distributed Rate Limiting**: Uses Redis as a backend for coordinated rate limiting across multiple application instances
+- **Sliding Window Algorithm**: Implements precise rate limiting using Redis sorted sets
+- **Queue Management**: Automatic queueing of rate-limited requests with configurable timeouts
+- **Fail-Open Strategy**: Gracefully handles Redis connectivity issues by allowing requests through
+- **Connection Pooling**: Efficient Redis connection management using Poolboy
+- **Flexible Configuration**: Per-key configuration with sensible defaults
 
 ## Installation
 
@@ -25,320 +23,237 @@ def deps do
 end
 ```
 
-## Quick Start
+## Configuration
 
-### 1. Configuration
-
-Configure Redis connection and default settings in your `config/config.exs`:
+Configure RateLtd in your `config/config.exs`:
 
 ```elixir
-config :rate_ltd, :redis,
-  host: "localhost",
-  port: 6379,
-  database: 0,
-  pool_size: 10,
-  timeout: 5_000
-
-config :rate_ltd, :defaults,
-  rate_limit_window_ms: 60_000,
-  queue_timeout_ms: 300_000,
-  max_queue_size: 1_000
+config :rate_ltd,
+  # Redis connection settings
+  redis: [
+    url: "redis://localhost:1234/0",
+    pool_size: 5
+  ],
+  # Default rate limiting settings
+  defaults: [
+    limit: 100,           # requests per window
+    window_ms: 60_000,    # 1 minute window
+    max_queue_size: 1000  # maximum queued requests
+  ],
+  # Per-key configurations
+  configs: %{
+    "api_calls" => %{limit: 1000, window_ms: 60_000, max_queue_size: 500},
+    "user_login" => {5, 300_000},  # 5 requests per 5 minutes (tuple format)
+    "heavy_operation" => %{limit: 10, window_ms: 3600_000, max_queue_size: 50}
+  }
 ```
 
-### 2. Basic Usage
+## Usage
+
+### Basic Rate Limiting
 
 ```elixir
-# Simple rate-limited request (blocks until executed)
-case RateLtd.request("external_api", fn ->
-  HTTPClient.get("https://api.example.com/data")
-end) do
-  {:ok, response} -> handle_success(response)
-  {:error, reason} -> handle_error(reason)
+# Simple rate check
+case RateLtd.check("api_user_123") do
+  {:allow, remaining} ->
+    IO.puts("Request allowed, #{remaining} requests remaining")
+  {:deny, retry_after_ms} ->
+    IO.puts("Rate limited, retry after #{retry_after_ms}ms")
 end
-
-# Check rate limit without executing
-case RateLtd.check("external_api") do
-  {:allow, remaining} -> make_request()
-  {:deny, retry_after_ms} -> Process.sleep(retry_after_ms)
-end
 ```
 
-### 3. Advanced Configuration
+### Execute Function with Rate Limiting
 
 ```elixir
-# Configure specific rate limits and queues
-rate_configs = [
-  RateLtd.RateLimitConfig.new("external_api", 100, 60_000),
-  RateLtd.RateLimitConfig.new("internal_api", 1000, 60_000)
-]
-
-queue_configs = [
-  RateLtd.QueueConfig.new("external_api:queue", max_size: 500),
-  RateLtd.QueueConfig.new("internal_api:queue", max_size: 100)
-]
-
-RateLtd.configure(rate_configs, queue_configs)
-```
-
-## Architecture
-
-### Caller-Side Execution Model
-
-RateLtd uses an efficient **caller-side execution** architecture:
-
-1. **Rate Limit Check**: QueueProcessor checks if rate limit allows execution
-2. **Slot Allocation**: When allowed, rate limit counter is incremented (slot consumed)
-3. **Execution Signal**: QueueProcessor signals the waiting caller process
-4. **Caller Execution**: The original caller process executes its own function
-5. **Direct Results**: Results stay in caller's process context
-
-This design provides:
-- ✅ **Better Performance**: No function serialization overhead
-- ✅ **Natural Concurrency**: No artificial bottlenecks
-- ✅ **Simpler Architecture**: Less infrastructure code
-- ✅ **Error Locality**: Errors handled in caller's context
-- ✅ **Memory Efficiency**: Functions not stored in Redis
-
-## Usage Examples
-
-### Blocking Mode (Default)
-
-```elixir
-# Basic blocking request
-{:ok, result} = RateLtd.request("api_key", fn ->
-  ThirdPartyAPI.call(data)
+# Execute a function with automatic rate limiting and queueing
+result = RateLtd.request("api_user_123", fn ->
+  # Your rate-limited operation here
+  HTTPoison.get("https://api.example.com/data")
 end)
 
-# With custom timeout
-{:ok, result} = RateLtd.request("api_key", fn ->
-  SlowAPI.call(data)
-end, %{timeout_ms: 60_000})
-
-# With priority (higher numbers = higher priority)
-{:ok, result} = RateLtd.request("api_key", fn ->
-  ImportantAPI.call(data)
-end, %{priority: 2, timeout_ms: 30_000})
-```
-
-### Async Mode
-
-```elixir
-case RateLtd.request("api_key", fn -> 
-  HTTPClient.get("/data") 
-end, %{async: true}) do
-  {:ok, response} -> 
-    # Executed immediately
-    handle_response(response)
-    
-  {:queued, %{request_id: id, estimated_wait_ms: wait_time}} ->
-    # Request was queued
-    IO.puts("Request queued, estimated wait: #{wait_time}ms")
-    
-    # Wait for execution signal
-    receive do
-      {:rate_ltd_execute, ^id} -> 
-        # Rate limit slot allocated, execute function
-        try do
-          result = HTTPClient.get("/data")
-          handle_response(result)
-        rescue
-          error -> handle_error(error)
-        end
-      {:rate_ltd_expired, ^id, :timeout} -> 
-        handle_timeout()
-    after 
-      60_000 -> handle_timeout()
-    end
-    
-  {:error, :queue_full} -> 
-    handle_queue_full()
+case result do
+  {:ok, response} ->
+    IO.puts("Function executed successfully")
+  {:error, :timeout} ->
+    IO.puts("Request timed out in queue")
+  {:error, :queue_full} ->
+    IO.puts("Queue is full, request rejected")
+  {:error, {:function_error, error}} ->
+    IO.puts("Function raised an error: #{inspect(error)}")
 end
 ```
 
-### Error Handling
+### Advanced Options
 
 ```elixir
-case RateLtd.request("api_key", fn -> 
-  risky_operation() 
-end) do
-  {:ok, result} -> 
-    handle_success(result)
-    
-  {:error, :timeout} -> 
-    handle_timeout()
-    
-  {:error, :queue_full} -> 
-    handle_queue_full()
-    
-  {:error, {:function_error, exception}} -> 
-    handle_function_error(exception)
-end
+# Custom timeout and retry settings
+RateLtd.request("heavy_task", fn ->
+  perform_heavy_computation()
+end, timeout_ms: 60_000, max_retries: 5)
 ```
 
-## Configuration Reference
-
-### Rate Limit Configuration
+### Reset Rate Limits
 
 ```elixir
-%RateLtd.RateLimitConfig{
-  key: "api_name:action",           # Unique identifier
-  limit: 20,                        # Requests per window
-  window_ms: 60_000,               # Time window in milliseconds
-  algorithm: :sliding_window        # :fixed_window | :sliding_window | :token_bucket
-}
+# Reset rate limit for a specific key
+RateLtd.reset("api_user_123")
 ```
 
-### Queue Configuration
+## How It Works
+
+### Sliding Window Algorithm
+
+RateLtd uses a sliding window algorithm implemented with Redis sorted sets:
+
+1. **Window Management**: Each request is stored with a timestamp in a Redis sorted set
+2. **Cleanup**: Expired entries outside the current window are automatically removed
+3. **Rate Checking**: Current request count is compared against the configured limit
+4. **Precise Timing**: Calculates exact retry-after times based on the oldest request
+
+### Queue Processing
+
+When rate limits are exceeded:
+
+1. **Queueing**: Requests are queued in Redis lists with expiration times
+2. **Background Processing**: A GenServer processes queues every 2 seconds
+3. **Process Signaling**: Waiting processes are notified when their turn arrives
+4. **Cleanup**: Expired requests and dead processes are automatically cleaned up
+
+### Architecture
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Application   │───▶│    RateLtd      │───▶│     Redis       │
+│                 │    │                 │    │                 │
+│  RateLtd.request│    │ ┌─────────────┐ │    │ ┌─────────────┐ │
+│  RateLtd.check  │    │ │   Limiter   │ │    │ │ Sorted Sets │ │
+│                 │    │ └─────────────┘ │    │ │    Lists    │ │
+│                 │    │ ┌─────────────┐ │    │ └─────────────┘ │
+│                 │    │ │    Queue    │ │    │                 │
+│                 │    │ └─────────────┘ │    │                 │
+│                 │    │ ┌─────────────┐ │    │                 │
+│                 │    │ │ Processor   │ │    │                 │
+│                 │    │ └─────────────┘ │    │                 │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+## API Reference
+
+### RateLtd.request/2,3
+
+Executes a function with rate limiting and automatic queueing.
 
 ```elixir
-%RateLtd.QueueConfig{
-  name: "api_name:queue",           # Queue identifier
-  max_size: 1000,                   # Maximum queued requests
-  request_timeout_ms: 300_000,      # Request TTL (5 minutes)
-  enable_priority: false,           # Priority queue support
-  overflow_strategy: :reject        # :reject | :drop_oldest
-}
+@spec request(String.t(), function()) :: {:ok, term()} | {:error, term()}
+@spec request(String.t(), function(), keyword()) :: {:ok, term()} | {:error, term()}
 ```
 
-### Request Options
+**Parameters:**
+- `key` - Rate limiting key (string)
+- `function` - Function to execute when rate limit allows
+- `opts` - Options (optional)
+  - `:timeout_ms` - Queue timeout in milliseconds (default: 30,000)
+  - `:max_retries` - Maximum retry attempts for short delays (default: 3)
+
+**Returns:**
+- `{:ok, result}` - Function executed successfully
+- `{:error, :timeout}` - Request timed out in queue
+- `{:error, :queue_full}` - Queue exceeded maximum size
+- `{:error, {:function_error, error}}` - Function raised an exception
+
+### RateLtd.check/1
+
+Checks if a request would be allowed without executing anything.
 
 ```elixir
-%RateLtd.RequestOptions{
-  timeout_ms: 30_000,               # How long to wait total (blocking mode)
-  priority: 1,                      # Queue priority (1 = highest)
-  async: false,                     # true = return immediately if queued
-  max_retries: 3                    # Number of immediate retries before queueing
-}
+@spec check(String.t()) :: {:allow, non_neg_integer()} | {:deny, non_neg_integer()}
 ```
 
-## Monitoring and Observability
+**Parameters:**
+- `key` - Rate limiting key (string)
 
-### Get Status Information
+**Returns:**
+- `{:allow, remaining}` - Request allowed, remaining requests in window
+- `{:deny, retry_after_ms}` - Request denied, retry after specified milliseconds
+
+### RateLtd.reset/1
+
+Resets the rate limit for a specific key.
 
 ```elixir
-status = RateLtd.get_status("api_key")
-
-# Rate limit status
-IO.inspect(status.rate_limit.remaining)  # Remaining requests
-IO.inspect(status.rate_limit.reset_at)   # When limit resets
-
-# Queue status  
-IO.inspect(status.queue.depth)           # Current queue depth
-IO.inspect(status.queue.oldest_request_age_ms)  # Age of oldest request
-
-# Processor status
-IO.inspect(status.processor.active)      # Is processor running
-IO.inspect(status.processor.queues_processed)  # Total queues processed
+@spec reset(String.t()) :: :ok
 ```
 
-### Telemetry Events
+**Parameters:**
+- `key` - Rate limiting key to reset (string)
 
-RateLtd emits telemetry events for monitoring:
+## Configuration Examples
+
+### API Rate Limiting
 
 ```elixir
-# Rate limiter events
-[:rate_ltd, :rate_limiter, :rate_limit_allowed]
-[:rate_ltd, :rate_limiter, :rate_limit_denied] 
-[:rate_ltd, :rate_limiter, :rate_limit_error]
-
-# Queue manager events
-[:rate_ltd, :queue_manager, :request_enqueued]
-[:rate_ltd, :queue_manager, :request_dequeued]
-[:rate_ltd, :queue_manager, :request_rejected]
-
-# Queue processor events
-[:rate_ltd, :queue_processor, :request_signaled]
-[:rate_ltd, :queue_processor, :request_caller_unavailable]
-[:rate_ltd, :queue_processor, :processing_completed]
+config :rate_ltd,
+  defaults: [limit: 1000, window_ms: 60_000],
+  configs: %{
+    "api_v1" => %{limit: 5000, window_ms: 60_000, max_queue_size: 1000},
+    "api_v2" => %{limit: 10000, window_ms: 60_000, max_queue_size: 2000}
+  }
 ```
 
-### Processor Control
+### User-Based Limits
 
 ```elixir
-# Pause queue processing
-RateLtd.QueueProcessor.pause()
-
-# Resume queue processing
-RateLtd.QueueProcessor.resume()
-
-# Get processor status
-status = RateLtd.QueueProcessor.get_status()
+# In your application
+user_key = "user:#{user_id}"
+RateLtd.request(user_key, fn ->
+  UserService.expensive_operation(user_id)
+end)
 ```
 
-## Production Considerations
-
-### Redis Setup
-
-- **Version**: Redis 6.0+ recommended
-- **Memory**: Configure appropriate memory limits for your queue sizes
-- **Persistence**: Enable RDB or AOF for queue persistence
-- **Clustering**: Redis Cluster supported for high availability
-
-### Performance Tuning
+### Service-to-Service Communication
 
 ```elixir
-# High-throughput configuration
-config :rate_ltd, :redis,
-  pool_size: 20,
-  timeout: 1_000
-
-config :rate_ltd, :processor,
-  polling_interval_ms: 500,
-  batch_size: 200
+service_key = "service:payment_processor"
+RateLtd.request(service_key, fn ->
+  PaymentAPI.process_payment(payment_params)
+end, timeout_ms: 10_000)
 ```
 
-### Memory Management
+## Error Handling
 
-- Set reasonable queue sizes to prevent memory issues
-- Use request timeouts to clean up old requests
-- Monitor Redis memory usage
-- Enable automatic cleanup in processor
+RateLtd implements a fail-open strategy for Redis connectivity issues:
 
-### Error Handling
+- **Redis Unavailable**: Requests are allowed through with maximum remaining count
+- **Invalid Responses**: Treated as successful rate limit checks
+- **Network Timeouts**: Default to allowing requests
 
-- RateLtd fails open when Redis is unavailable
-- Implement circuit breakers for external APIs
-- Monitor queue depths and processing latency
-- Set up alerts for Redis connection issues
+## Performance Considerations
+
+- **Redis Operations**: Most operations use atomic Lua scripts for consistency
+- **Connection Pooling**: Configurable pool size (default: 5 connections)
+- **Queue Processing**: Runs every 2 seconds with minimal Redis queries
+- **Memory Usage**: Automatic cleanup of expired entries and dead processes
 
 ## Testing
 
-Run the test suite:
+RateLtd includes support for testing by allowing Redis module injection:
 
-```bash
-mix test
-```
-
-For integration tests with Redis:
-
-```bash
-# Start Redis
-redis-server
-
-# Run tests
-mix test
+```elixir
+# In test configuration
+config :rate_ltd, redis_module: MockRedis
 ```
 
 ## Contributing
 
 1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Run the test suite
-6. Submit a pull request
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Run tests (`mix test`)
+4. Run Credo (`mix credo`)
+5. Run Dialyzer (`mix dialyzer`)
+6. Commit your changes (`git commit -am 'Add amazing feature'`)
+7. Push to the branch (`git push origin feature/amazing-feature`)
+8. Open a Pull Request
 
 ## License
 
-MIT License. See LICENSE for details.
-
-## Changelog
-
-### Version 0.1.0
-
-- Initial release
-- Basic rate limiting with Redis backend
-- Request queueing with configurable options
-- Background queue processor
-- Telemetry integration
-- Comprehensive test suite
+This project is licensed under the MIT License - see the LICENSE file for details.
