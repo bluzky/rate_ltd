@@ -24,7 +24,7 @@ defmodule RateLtd.Queue do
     return {1, position}
     """
 
-    case RateLtd.Redis.eval(script, [queue_key], [config.max_queue_size, request_data]) do
+    case redis_module().eval(script, [queue_key], [config.max_queue_size, request_data]) do
       {:ok, [1, position]} -> {:ok, position}
       {:ok, [0, _reason]} -> {:error, :queue_full}
       {:error, reason} -> {:error, reason}
@@ -34,7 +34,7 @@ defmodule RateLtd.Queue do
   def peek_next(queue_name) do
     queue_key = "rate_ltd:queue:#{queue_name}"
 
-    case RateLtd.Redis.command(["LINDEX", queue_key, -1]) do
+    case redis_module().command(["LINDEX", queue_key, -1]) do
       {:ok, nil} -> {:empty}
       {:ok, data} -> decode_request(data)
       {:error, _} -> {:empty}
@@ -44,7 +44,7 @@ defmodule RateLtd.Queue do
   def dequeue(queue_name) do
     queue_key = "rate_ltd:queue:#{queue_name}"
 
-    case RateLtd.Redis.command(["RPOP", queue_key]) do
+    case redis_module().command(["RPOP", queue_key]) do
       {:ok, nil} -> {:empty}
       {:ok, data} -> decode_request(data)
       {:error, _} -> {:empty}
@@ -52,7 +52,7 @@ defmodule RateLtd.Queue do
   end
 
   def list_active_queues do
-    case RateLtd.Redis.command(["KEYS", "rate_ltd:queue:*"]) do
+    case redis_module().command(["KEYS", "rate_ltd:queue:*"]) do
       {:ok, keys} ->
         keys
         |> Enum.map(&extract_queue_name/1)
@@ -72,4 +72,8 @@ defmodule RateLtd.Queue do
 
   defp extract_queue_name("rate_ltd:queue:" <> queue_name), do: queue_name
   defp extract_queue_name(_), do: nil
+
+  defp redis_module do
+    Application.get_env(:rate_ltd, :redis_module, RateLtd.Redis)
+  end
 end

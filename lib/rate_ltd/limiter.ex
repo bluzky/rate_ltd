@@ -1,3 +1,4 @@
+# lib/rate_ltd/limiter.ex
 defmodule RateLtd.Limiter do
   @moduledoc """
   Rate limiting logic using Redis sliding window algorithm.
@@ -43,7 +44,7 @@ defmodule RateLtd.Limiter do
     request_id = generate_id()
     redis_key = "rate_ltd:#{key}"
 
-    case RateLtd.Redis.eval(@sliding_window_script, [redis_key], [
+    case redis_module().eval(@sliding_window_script, [redis_key], [
            config.window_ms,
            config.limit,
            now,
@@ -58,9 +59,13 @@ defmodule RateLtd.Limiter do
 
   def reset(key) do
     redis_key = "rate_ltd:#{key}"
-    RateLtd.Redis.command(["DEL", redis_key])
+    redis_module().command(["DEL", redis_key])
     :ok
   end
 
   defp generate_id, do: :crypto.strong_rand_bytes(8) |> Base.encode64(padding: false)
+
+  defp redis_module do
+    Application.get_env(:rate_ltd, :redis_module, RateLtd.Redis)
+  end
 end

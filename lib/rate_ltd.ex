@@ -14,6 +14,7 @@ defmodule RateLtd do
     case attempt_with_retries(key, function, max_retries) do
       {:ok, result} -> {:ok, result}
       :rate_limited -> queue_and_wait(key, function, timeout_ms)
+      {:error, error} -> {:error, error}
     end
   end
 

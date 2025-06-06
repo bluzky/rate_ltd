@@ -15,7 +15,7 @@ defmodule RateLtd.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :telemetry],
+      extra_applications: [:logger],
       mod: {RateLtd.Application, []}
     ]
   end

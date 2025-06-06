@@ -5,8 +5,8 @@ defmodule RateLtd.QueueProcessor do
   """
   use GenServer
 
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, [], name: opts[:name] || __MODULE__)
   end
 
   def init(_) do
@@ -45,9 +45,11 @@ defmodule RateLtd.QueueProcessor do
           case RateLtd.Limiter.check_rate(request["rate_limit_key"], config) do
             {:allow, _remaining} ->
               # Signal the waiting process
-              caller_pid = :erlang.binary_to_term(Base.decode64!(request["caller_pid"]))
+              caller_pid =
+                request["caller_pid"] &&
+                  :erlang.binary_to_term(Base.decode64!(request["caller_pid"]))
 
-              if Process.alive?(caller_pid) do
+              if caller_pid && Process.alive?(caller_pid) do
                 send(caller_pid, {:rate_ltd_execute, request["id"]})
                 RateLtd.Queue.dequeue(queue_name)
                 # Try next request
