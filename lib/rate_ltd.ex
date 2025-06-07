@@ -1,40 +1,117 @@
+# lib/rate_ltd.ex
 defmodule RateLtd do
   @moduledoc """
-  Simple rate limiter with Redis backend and minimal queueing.
+  Enhanced rate limiter with tuple-based API supporting grouped buckets.
+
+  Supports both simple string keys and {api_key, group} tuples for
+  fine-grained rate limiting control.
+
+  ## Examples
+
+      # Simple string key
+      RateLtd.request("api_user_123", fn ->
+        API.call()
+      end)
+
+      # Grouped bucket - separate limits per service
+      RateLtd.request({"merchant_123", "payment_api"}, fn ->
+        PaymentProcessor.charge(params)
+      end)
+
+      RateLtd.request({"merchant_123", "search_api"}, fn ->
+        SearchService.query(params)
+      end)
   """
 
+  @type rate_limit_key :: String.t() | {String.t(), String.t()}
   @type result :: {:ok, term()} | {:error, term()}
 
-  @spec request(String.t(), function()) :: result()
-  @spec request(String.t(), function(), keyword()) :: result()
+  @spec request(rate_limit_key(), function()) :: result()
+  @spec request(rate_limit_key(), function(), keyword()) :: result()
   def request(key, function, opts \\ []) do
     timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
     max_retries = Keyword.get(opts, :max_retries, 3)
 
-    case attempt_with_retries(key, function, max_retries) do
+    normalized_key = normalize_key(key)
+
+    case attempt_with_retries(normalized_key, function, max_retries) do
       {:ok, result} -> {:ok, result}
-      :rate_limited -> queue_and_wait(key, function, timeout_ms)
+      :rate_limited -> queue_and_wait(normalized_key, function, timeout_ms)
       {:error, error} -> {:error, error}
     end
   end
 
-  @spec check(String.t()) :: {:allow, non_neg_integer()} | {:deny, non_neg_integer()}
+  @spec check(rate_limit_key()) :: {:allow, non_neg_integer()} | {:deny, non_neg_integer()}
   def check(key) do
-    config = get_config(key)
-    RateLtd.Limiter.check_rate(key, config)
+    normalized_key = normalize_key(key)
+    config = RateLtd.ConfigManager.get_config(normalized_key)
+    RateLtd.Limiter.check_rate(normalized_key, config)
   end
 
-  @spec reset(String.t()) :: :ok
+  @spec reset(rate_limit_key()) :: :ok
   def reset(key) do
-    RateLtd.Limiter.reset(key)
+    normalized_key = normalize_key(key)
+    RateLtd.Limiter.reset(normalized_key)
+  end
+
+  @spec get_bucket_stats(rate_limit_key()) :: map()
+  def get_bucket_stats(key) do
+    normalized_key = normalize_key(key)
+    config = RateLtd.ConfigManager.get_config(normalized_key)
+
+    case check(key) do
+      {:allow, remaining} ->
+        %{
+          bucket_key: normalized_key,
+          original_key: key,
+          used: config.limit - remaining,
+          remaining: remaining,
+          limit: config.limit,
+          window_ms: config.window_ms,
+          bucket_type: get_bucket_type(key)
+        }
+
+      {:deny, retry_after} ->
+        %{
+          bucket_key: normalized_key,
+          original_key: key,
+          used: config.limit,
+          remaining: 0,
+          limit: config.limit,
+          window_ms: config.window_ms,
+          retry_after_ms: retry_after,
+          bucket_type: get_bucket_type(key)
+        }
+    end
+  end
+
+  @spec list_active_buckets() :: [String.t()]
+  def list_active_buckets do
+    RateLtd.BucketManager.list_active_buckets()
+  end
+
+  @spec get_group_summary(String.t()) :: map()
+  def get_group_summary(group) do
+    RateLtd.BucketManager.get_group_summary(group)
   end
 
   # Private functions
 
-  defp attempt_with_retries(key, function, retries_left) when retries_left > 0 do
-    config = get_config(key)
+  defp normalize_key({api_key, group}) when is_binary(api_key) and is_binary(group) do
+    "bucket:#{group}:#{api_key}"
+  end
 
-    case RateLtd.Limiter.check_rate(key, config) do
+  defp normalize_key(key) when is_binary(key) do
+    "simple:#{key}"
+  end
+
+  defp get_bucket_type({_api_key, _group}), do: :grouped_bucket
+  defp get_bucket_type(_key), do: :simple_bucket
+
+  defp attempt_with_retries(normalized_key, function, retries_left) when retries_left > 0 do
+    config = RateLtd.ConfigManager.get_config(normalized_key)
+
+    case RateLtd.Limiter.check_rate(normalized_key, config) do
       {:allow, _remaining} ->
         try do
           {:ok, function.()}
@@ -44,24 +121,24 @@ defmodule RateLtd do
 
       {:deny, retry_after} when retry_after < 1000 ->
         Process.sleep(retry_after)
-        attempt_with_retries(key, function, retries_left - 1)
+        attempt_with_retries(normalized_key, function, retries_left - 1)
 
       {:deny, _retry_after} ->
         :rate_limited
     end
   end
 
-  defp attempt_with_retries(_key, _function, 0), do: :rate_limited
+  defp attempt_with_retries(_normalized_key, _function, 0), do: :rate_limited
 
-  defp queue_and_wait(key, function, timeout_ms) do
-    queue_name = "#{key}:queue"
-    config = get_config(key)
+  defp queue_and_wait(normalized_key, function, timeout_ms) do
+    queue_name = "#{normalized_key}:queue"
+    config = RateLtd.ConfigManager.get_config(normalized_key)
     request_id = generate_id()
 
     request = %{
       id: request_id,
       queue_name: queue_name,
-      rate_limit_key: key,
+      rate_limit_key: normalized_key,
       caller_pid: :erlang.term_to_binary(self()) |> Base.encode64(),
       queued_at: System.system_time(:millisecond),
       expires_at: System.system_time(:millisecond) + timeout_ms
@@ -82,30 +159,6 @@ defmodule RateLtd do
 
       {:error, :queue_full} ->
         {:error, :queue_full}
-    end
-  end
-
-  defp get_config(key) do
-    defaults = Application.get_env(:rate_ltd, :defaults, [])
-    custom_configs = Application.get_env(:rate_ltd, :configs, %{})
-
-    case Map.get(custom_configs, key) do
-      nil ->
-        %{
-          limit: Keyword.get(defaults, :limit, 100),
-          window_ms: Keyword.get(defaults, :window_ms, 60_000),
-          max_queue_size: Keyword.get(defaults, :max_queue_size, 1000)
-        }
-
-      config when is_map(config) ->
-        config
-
-      {limit, window_ms} ->
-        %{
-          limit: limit,
-          window_ms: window_ms,
-          max_queue_size: Keyword.get(defaults, :max_queue_size, 1000)
-        }
     end
   end
 

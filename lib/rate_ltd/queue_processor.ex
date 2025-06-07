@@ -49,7 +49,7 @@ defmodule RateLtd.QueueProcessor do
                 request["caller_pid"] &&
                   :erlang.binary_to_term(Base.decode64!(request["caller_pid"]))
 
-              if caller_pid && Process.alive?(caller_pid) do
+              if is_pid(caller_pid) && Process.alive?(caller_pid) do
                 send(caller_pid, {:rate_ltd_execute, request["id"]})
                 RateLtd.Queue.dequeue(queue_name)
                 # Try next request
