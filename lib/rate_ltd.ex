@@ -59,7 +59,7 @@ defmodule RateLtd do
     normalized_key = normalize_key(key)
     config = RateLtd.ConfigManager.get_config(normalized_key)
 
-    case check(key) do
+    case RateLtd.Limiter.check_rate_without_increment(normalized_key, config) do
       {:allow, remaining} ->
         %{
           bucket_key: normalized_key,

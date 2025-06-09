@@ -30,15 +30,12 @@ defmodule RateLtd.BucketManager do
 
   @spec list_active_buckets() :: [String.t()]
   def list_active_buckets do
-    case redis_module().command(["KEYS", "rate_ltd:bucket:*", "rate_ltd:simple:*"]) do
-      {:ok, keys} ->
-        (keys || [])
-        |> Enum.map(&extract_bucket_name/1)
-        |> Enum.reject(&is_nil/1)
+    bucket_keys = scan_keys("rate_ltd:bucket:*")
+    simple_keys = scan_keys("rate_ltd:simple:*")
 
-      {:error, _} ->
-        []
-    end
+    (bucket_keys ++ simple_keys)
+    |> Enum.map(&extract_bucket_name/1)
+    |> Enum.reject(&is_nil/1)
   end
 
   @spec get_group_summary(String.t()) :: group_summary()
@@ -198,6 +195,29 @@ defmodule RateLtd.BucketManager do
   end
 
   # Private functions
+
+  # Helper function to scan keys with pattern
+  defp scan_keys(pattern) do
+    scan_keys(pattern, "0", [])
+  end
+
+  defp scan_keys(pattern, cursor, acc) do
+    case redis_module().command(["SCAN", cursor, "MATCH", pattern, "COUNT", "100"]) do
+      {:ok, [next_cursor, keys]} ->
+        new_acc = acc ++ keys
+
+        if next_cursor == "0" do
+          # Scan complete
+          new_acc
+        else
+          # Continue scanning
+          scan_keys(pattern, next_cursor, new_acc)
+        end
+
+      {:error, _} ->
+        acc
+    end
+  end
 
   defp extract_bucket_name("rate_ltd:" <> bucket_name), do: bucket_name
   defp extract_bucket_name(_), do: nil

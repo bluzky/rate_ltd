@@ -55,17 +55,14 @@ defmodule RateLtd.ConfigManager do
     api_key_configs = get_api_key_configs()
 
     # Priority: api_key specific > group specific > defaults
-    config =
-      case Map.get(api_key_configs, "#{group}:#{api_key}") do
-        nil ->
-          case Map.get(group_configs, group) do
-            nil -> build_default_config(defaults)
-            group_config -> normalize_config(group_config, defaults)
-          end
+    api_key_config =
+      Map.get(api_key_configs, "#{group}:#{api_key}") || %{}
 
-        api_key_config ->
-          normalize_config(api_key_config, defaults)
-      end
+    group_config = Map.get(group_configs, group) || %{}
+
+    config =
+      Map.merge(group_config, api_key_config)
+      |> normalize_config(defaults)
 
     Map.put(config, :bucket_type, :grouped)
   end
