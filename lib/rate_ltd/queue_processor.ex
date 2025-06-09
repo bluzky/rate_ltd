@@ -1,7 +1,7 @@
 # lib/rate_ltd/queue_processor.ex
 defmodule RateLtd.QueueProcessor do
   @moduledoc """
-  Minimal queue processor that signals waiting processes.
+  Local queue processor with lightweight parallel signaling by rate limit key.
   """
   use GenServer
 
@@ -15,62 +15,69 @@ defmodule RateLtd.QueueProcessor do
   end
 
   def handle_info(:check_queues, state) do
-    process_ready_requests()
+    process_local_queue_parallel()
     schedule_check()
     {:noreply, state}
   end
 
   defp schedule_check do
-    # Check every 2 seconds
-    Process.send_after(self(), :check_queues, 2000)
+    interval = Application.get_env(:rate_ltd, :queue_check_interval, 1000)
+    Process.send_after(self(), :check_queues, interval)
   end
 
-  defp process_ready_requests do
-    RateLtd.Queue.list_active_queues()
-    |> Enum.each(&try_process_queue/1)
+  # NEW: Parallel processing by rate limit key
+  defp process_local_queue_parallel do
+    # Get batch of requests from queue
+    requests = RateLtd.LocalQueue.get_next_batch(50)
+
+    if length(requests) > 0 do
+      # Group requests by rate limit key
+      grouped = Enum.group_by(requests, fn req -> req["rate_limit_key"] end)
+
+      # Process each key group in parallel
+      grouped
+      |> Enum.map(fn {key, key_requests} ->
+        Task.async(fn -> process_key_signals(key, key_requests) end)
+      end)
+      # 5 second timeout for all tasks
+      |> Task.await_many(5000)
+    end
   end
 
-  defp try_process_queue(queue_name) do
-    case RateLtd.Queue.peek_next(queue_name) do
-      {:ok, request} ->
-        if request_expired?(request) do
-          # Remove expired request
-          RateLtd.Queue.dequeue(queue_name)
-          # Try next request
-          try_process_queue(queue_name)
-        else
-          # Check if rate limit allows
-          config = get_config(request["rate_limit_key"])
+  # Process requests for a specific rate limit key (sequentially within key)
+  defp process_key_signals(key, requests) do
+    config = RateLtd.ConfigManager.get_config(key)
 
-          case RateLtd.Limiter.check_rate(request["rate_limit_key"], config) do
+    # Process requests for this key until rate limited
+    Enum.reduce_while(requests, :continue, fn request, _acc ->
+      cond do
+        request_expired?(request) ->
+          RateLtd.LocalQueue.dequeue_specific(request["id"])
+          {:cont, :continue}
+
+        true ->
+          case RateLtd.Limiter.check_rate(key, config) do
             {:allow, _remaining} ->
-              # Signal the waiting process
-              caller_pid =
-                request["caller_pid"] &&
-                  :erlang.binary_to_term(Base.decode64!(request["caller_pid"]))
-
-              if is_pid(caller_pid) && Process.alive?(caller_pid) do
-                send(caller_pid, {:rate_ltd_execute, request["id"]})
-                RateLtd.Queue.dequeue(queue_name)
-                # Try next request
-                try_process_queue(queue_name)
-              else
-                # Dead process, remove request
-                RateLtd.Queue.dequeue(queue_name)
-                try_process_queue(queue_name)
-              end
+              signal_client_and_dequeue(request)
+              {:cont, :continue}
 
             {:deny, _retry_after} ->
-              # Still rate limited, leave in queue
-              :ok
+              # Stop processing this key
+              {:halt, :stop}
           end
-        end
+      end
+    end)
+  end
 
-      {:empty} ->
-        :ok
+  defp signal_client_and_dequeue(request) do
+    caller_pid = :erlang.binary_to_term(Base.decode64!(request["caller_pid"]))
 
-      {:error, _} ->
-        :ok
+    if is_pid(caller_pid) && Process.alive?(caller_pid) do
+      send(caller_pid, {:rate_ltd_execute, request["id"]})
+      RateLtd.LocalQueue.dequeue_specific(request["id"])
+    else
+      # Dead process, just remove from queue
+      RateLtd.LocalQueue.dequeue_specific(request["id"])
     end
   end
 
@@ -78,24 +85,5 @@ defmodule RateLtd.QueueProcessor do
     now = System.system_time(:millisecond)
     expires_at = request["expires_at"]
     now > expires_at
-  end
-
-  defp get_config(key) do
-    defaults = Application.get_env(:rate_ltd, :defaults, [])
-    custom_configs = Application.get_env(:rate_ltd, :configs, %{})
-
-    case Map.get(custom_configs, key) do
-      nil ->
-        %{
-          limit: Keyword.get(defaults, :limit, 100),
-          window_ms: Keyword.get(defaults, :window_ms, 60_000)
-        }
-
-      config when is_map(config) ->
-        config
-
-      {limit, window_ms} ->
-        %{limit: limit, window_ms: window_ms}
-    end
   end
 end

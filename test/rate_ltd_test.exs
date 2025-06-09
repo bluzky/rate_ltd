@@ -21,8 +21,14 @@ defmodule RateLtdTest do
       "api:premium_user" => %{limit: 5000, window_ms: 60_000, max_queue_size: 1000}
     })
 
-    # Clear Redis before each test
+    Application.put_env(:rate_ltd, :queue_check_interval, 100)
+
+    # Clear Redis and local queue before each test
     TestHelper.clear_redis()
+    TestHelper.clear_local_queue()
+
+    # Start queue processor for tests
+    RateLtd.QueueProcessor.start_link([])
 
     :ok
   end
@@ -43,25 +49,35 @@ defmodule RateLtdTest do
     end
 
     test "works with grouped bucket tuples" do
-      result = RateLtd.request({"premium_user", "api"}, fn -> "grouped success" end)
+      result = RateLtd.request({"api", "premium_user"}, fn -> "grouped success" end)
       assert {:ok, "grouped success"} = result
     end
 
-    test "respects rate limits" do
+    test "respects rate limits and uses local queue" do
       key = TestHelper.unique_key("rate_limit_test")
 
       # Configure very low limit for testing
       Application.put_env(:rate_ltd, :configs, %{
-        key => %{limit: 2, window_ms: 60_000, max_queue_size: 100}
+        key => %{limit: 2, window_ms: 5000, max_queue_size: 100}
       })
 
       # First requests should succeed
       assert {:ok, "result1"} = RateLtd.request(key, fn -> "result1" end)
       assert {:ok, "result2"} = RateLtd.request(key, fn -> "result2" end)
 
-      # Third request might be rate limited (depending on timing)
-      result = RateLtd.request(key, fn -> "result3" end, timeout_ms: 1000)
-      assert match?({:ok, _}, result) or match?({:error, _}, result)
+      # Third request should be queued locally
+      task =
+        Task.async(fn ->
+          RateLtd.request(key, fn -> "result3" end, timeout_ms: 9000)
+        end)
+
+      # Verify request is in local queue
+      Process.sleep(100)
+      assert RateLtd.LocalQueue.count_local_pending() > 0
+
+      # Should eventually succeed when rate limit allows
+      result = Task.await(task, 10000)
+      assert {:ok, "result3"} = result
     end
   end
 
@@ -91,6 +107,114 @@ defmodule RateLtdTest do
       result = RateLtd.request(key, fn -> "should timeout" end, timeout_ms: 100)
       assert {:error, :timeout} = result
     end
+
+    test "returns queue_full when local queue is full" do
+      key = TestHelper.unique_key("queue_full_test")
+
+      # Configure very small queue and no rate limit
+      Application.put_env(:rate_ltd, :configs, %{
+        key => %{limit: 0, window_ms: 60_000, max_queue_size: 2}
+      })
+
+      # Fill up the queue
+      task1 =
+        Task.async(fn ->
+          RateLtd.request(key, fn -> "result1" end, timeout_ms: 5000)
+        end)
+
+      task2 =
+        Task.async(fn ->
+          RateLtd.request(key, fn -> "result2" end, timeout_ms: 5000)
+        end)
+
+      Process.sleep(100)
+
+      # Third request should fail with queue_full
+      result = RateLtd.request(key, fn -> "result3" end, timeout_ms: 100)
+      assert {:error, :queue_full} = result
+
+      # Cleanup
+      Task.shutdown(task1, :brutal_kill)
+      Task.shutdown(task2, :brutal_kill)
+    end
+  end
+
+  describe "local queue operations" do
+    test "local queue enqueue and dequeue work correctly" do
+      config = %{max_queue_size: 10}
+
+      request = %{
+        "id" => "test-123",
+        "rate_limit_key" => "test:key",
+        "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+        "queued_at" => System.system_time(:millisecond),
+        "expires_at" => System.system_time(:millisecond) + 30_000
+      }
+
+      # Test enqueue
+      assert {:ok, 1} = RateLtd.LocalQueue.enqueue(request, config)
+      assert RateLtd.LocalQueue.count_local_pending() == 1
+
+      # Test peek
+      assert {:ok, peeked_request} = RateLtd.LocalQueue.peek_next()
+      assert peeked_request["id"] == "test-123"
+
+      # Test dequeue
+      assert {:ok, dequeued_request} = RateLtd.LocalQueue.dequeue()
+      assert dequeued_request["id"] == "test-123"
+      assert RateLtd.LocalQueue.count_local_pending() == 0
+
+      # Test empty queue
+      assert {:empty} = RateLtd.LocalQueue.peek_next()
+      assert {:empty} = RateLtd.LocalQueue.dequeue()
+    end
+
+    test "local queue respects max size" do
+      config = %{max_queue_size: 2}
+
+      request1 = %{
+        "id" => "test-1",
+        "rate_limit_key" => "test:key",
+        "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+        "queued_at" => System.system_time(:millisecond),
+        "expires_at" => System.system_time(:millisecond) + 30_000
+      }
+
+      request2 = Map.put(request1, "id", "test-2")
+      request3 = Map.put(request1, "id", "test-3")
+
+      # Fill up queue
+      assert {:ok, 1} = RateLtd.LocalQueue.enqueue(request1, config)
+      assert {:ok, 2} = RateLtd.LocalQueue.enqueue(request2, config)
+
+      # Third should fail
+      assert {:error, :queue_full} = RateLtd.LocalQueue.enqueue(request3, config)
+    end
+
+    test "redis pending counters are updated correctly" do
+      config = %{max_queue_size: 10}
+
+      request = %{
+        "id" => "test-counter",
+        "rate_limit_key" => "test:counter:key",
+        "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+        "queued_at" => System.system_time(:millisecond),
+        "expires_at" => System.system_time(:millisecond) + 30_000
+      }
+
+      # Enqueue should increment counter
+      {:ok, _} = RateLtd.LocalQueue.enqueue(request, config)
+
+      pending_key = "rate_ltd:pending:test:counter:key"
+      {:ok, count_str} = RateLtd.Redis.command(["GET", pending_key])
+      assert String.to_integer(count_str) == 1
+
+      # Dequeue should decrement counter
+      {:ok, _} = RateLtd.LocalQueue.dequeue()
+
+      {:ok, count_str} = RateLtd.Redis.command(["GET", pending_key])
+      assert count_str == "0" or is_nil(count_str)
+    end
   end
 
   describe "check/1" do
@@ -103,21 +227,24 @@ defmodule RateLtdTest do
     end
 
     test "returns allow with remaining count for grouped bucket" do
-      result = RateLtd.check({"user123", "api"})
+      result = RateLtd.check({"api", "user123"})
       assert {:allow, remaining} = result
       assert is_integer(remaining) and remaining >= 0
     end
 
-    test "decreases remaining count with each check" do
-      key = TestHelper.unique_key("check_decrease")
+    test "does not consume quota when checking" do
+      key = TestHelper.unique_key("check_no_consume")
 
+      # Multiple checks should return the same remaining count
       {:allow, remaining1} = RateLtd.check(key)
       {:allow, remaining2} = RateLtd.check(key)
+      {:allow, remaining3} = RateLtd.check(key)
 
-      assert remaining2 == remaining1 - 1
+      assert remaining1 == remaining2
+      assert remaining2 == remaining3
     end
 
-    test "returns deny when limit exceeded" do
+    test "returns deny when limit already exceeded" do
       key = TestHelper.unique_key("check_limit")
 
       # Configure very low limit
@@ -125,12 +252,39 @@ defmodule RateLtdTest do
         key => %{limit: 1, window_ms: 60_000, max_queue_size: 100}
       })
 
-      # First check should allow
-      assert {:allow, 0} = RateLtd.check(key)
+      # Use up the limit with actual requests (not checks)
+      assert {:ok, _} = RateLtd.request(key, fn -> "consumed quota" end)
 
-      # Second check should deny
+      # Now check should deny since limit is exceeded
       assert {:deny, retry_after} = RateLtd.check(key)
       assert is_integer(retry_after) and retry_after > 0
+
+      # Multiple checks should still deny
+      assert {:deny, _} = RateLtd.check(key)
+      assert {:deny, _} = RateLtd.check(key)
+    end
+
+    test "returns correct remaining count after actual quota consumption" do
+      key = TestHelper.unique_key("check_after_request")
+
+      # Configure limit for testing
+      Application.put_env(:rate_ltd, :configs, %{
+        key => %{limit: 5, window_ms: 60_000, max_queue_size: 100}
+      })
+
+      # Initial check should show full limit
+      assert {:allow, 5} = RateLtd.check(key)
+
+      # Consume some quota with actual request
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
+
+      # Check should now show reduced remaining count
+      assert {:allow, 3} = RateLtd.check(key)
+
+      # Multiple checks should return same count
+      assert {:allow, 3} = RateLtd.check(key)
+      assert {:allow, 3} = RateLtd.check(key)
     end
   end
 
@@ -138,29 +292,44 @@ defmodule RateLtdTest do
     test "resets rate limit for simple key" do
       key = TestHelper.unique_key("reset_simple")
 
-      # Use up the limit
-      RateLtd.check(key)
-      RateLtd.check(key)
+      # Configure low limit for testing
+      Application.put_env(:rate_ltd, :configs, %{
+        key => %{limit: 2, window_ms: 60_000, max_queue_size: 100}
+      })
+
+      # Use up the limit with actual requests
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
+
+      # Should be at limit now
+      assert {:deny, _} = RateLtd.check(key)
 
       # Reset
       assert :ok = RateLtd.reset(key)
 
-      # Should be able to make requests again
-      assert {:allow, _} = RateLtd.check(key)
+      # Should be able to check and make requests again
+      assert {:allow, 2} = RateLtd.check(key)
+      assert {:ok, _} = RateLtd.request(key, fn -> "after reset" end)
     end
 
     test "resets rate limit for grouped bucket" do
-      # Use some of the limit
-      RateLtd.check({"user123", "api"})
-      RateLtd.check({"user123", "api"})
+      # Configure for testing
+      Application.put_env(:rate_ltd, :group_configs, %{
+        "api" => %{limit: 3, window_ms: 60_000, max_queue_size: 500}
+      })
+
+      # Use some of the limit with actual requests
+      assert {:ok, _} = RateLtd.request({"api", "user123"}, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request({"api", "user123"}, fn -> "request2" end)
+
+      # Check remaining should be 1
+      assert {:allow, 1} = RateLtd.check({"api", "user123"})
 
       # Reset
-      assert :ok = RateLtd.reset({"user123", "api"})
+      assert :ok = RateLtd.reset({"api", "user123"})
 
       # Should be back to full limit
-      {:allow, remaining} = RateLtd.check({"user123", "api"})
-      # 1000 - 1 (for the check we just made)
-      assert remaining == 999
+      assert {:allow, 3} = RateLtd.check({"api", "user123"})
     end
   end
 
@@ -169,7 +338,7 @@ defmodule RateLtdTest do
       key = TestHelper.unique_key("stats_simple")
 
       # Make a request to create the bucket
-      RateLtd.check(key)
+      assert {:ok, _} = RateLtd.request(key, fn -> "create bucket" end)
 
       stats = RateLtd.get_bucket_stats(key)
 
@@ -185,11 +354,14 @@ defmodule RateLtdTest do
     end
 
     test "returns stats for grouped bucket" do
-      stats = RateLtd.get_bucket_stats({"user123", "api"})
+      # Make a request to create the bucket
+      assert {:ok, _} = RateLtd.request({"api", "user123"}, fn -> "create bucket" end)
+
+      stats = RateLtd.get_bucket_stats({"api", "user123"})
 
       assert %{
                bucket_key: "bucket:api:user123",
-               original_key: {"user123", "api"},
+               original_key: {"api", "user123"},
                bucket_type: :grouped_bucket,
                limit: 1000,
                window_ms: 60_000
@@ -199,19 +371,39 @@ defmodule RateLtdTest do
     test "includes usage information" do
       key = TestHelper.unique_key("stats_usage")
 
-      # Make some requests
-      RateLtd.check(key)
+      # Make some requests to consume quota
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
 
-      RateLtd.check(key)
-
-      stats =
-        RateLtd.get_bucket_stats(key)
+      stats = RateLtd.get_bucket_stats(key)
 
       # Should show usage
       assert %{used: used, remaining: remaining} = stats
       assert used == 2
       # 100 - 2
       assert remaining == 98
+    end
+
+    test "check does not affect usage statistics" do
+      key = TestHelper.unique_key("stats_check_no_affect")
+
+      # Make one actual request
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+
+      # Get initial stats
+      stats1 = RateLtd.get_bucket_stats(key)
+      assert stats1.used == 1
+      assert stats1.remaining == 99
+
+      # Multiple checks should not change usage
+      RateLtd.check(key)
+      RateLtd.check(key)
+      RateLtd.check(key)
+
+      stats2 = RateLtd.get_bucket_stats(key)
+      assert stats2.used == 1
+      assert stats2.remaining == 99
+      assert stats1 == stats2
     end
   end
 
@@ -220,10 +412,10 @@ defmodule RateLtdTest do
       key1 = TestHelper.unique_key("list_test1")
       key2 = TestHelper.unique_key("list_test2")
 
-      # Create some buckets by making requests
-      RateLtd.check(key1)
-      RateLtd.check({"user2", "api"})
-      RateLtd.check(key2)
+      # Create some buckets by making actual requests
+      assert {:ok, _} = RateLtd.request(key1, fn -> "create bucket1" end)
+      assert {:ok, _} = RateLtd.request({"api", "user2"}, fn -> "create bucket2" end)
+      assert {:ok, _} = RateLtd.request(key2, fn -> "create bucket3" end)
 
       buckets = RateLtd.list_active_buckets()
       assert is_list(buckets)
@@ -243,11 +435,11 @@ defmodule RateLtdTest do
   end
 
   describe "get_group_summary/1" do
-    test "returns summary for existing group" do
-      # Create some buckets in the group
-      RateLtd.check({"user1", "api"})
-      RateLtd.check({"user2", "api"})
-      RateLtd.check({"user3", "api"})
+    test "returns summary for existing group with pending message counts" do
+      # Create some buckets in the group with actual requests
+      assert {:ok, _} = RateLtd.request({"api", "user1"}, fn -> "create bucket1" end)
+      assert {:ok, _} = RateLtd.request({"api", "user2"}, fn -> "create bucket2" end)
+      assert {:ok, _} = RateLtd.request({"api", "user3"}, fn -> "create bucket3" end)
 
       summary = RateLtd.get_group_summary("api")
 
@@ -256,7 +448,8 @@ defmodule RateLtdTest do
                bucket_count: bucket_count,
                buckets: buckets,
                total_usage: total_usage,
-               active_queues: active_queues,
+               total_pending: total_pending,
+               local_pending: local_pending,
                avg_utilization: avg_utilization,
                peak_utilization: peak_utilization
              } = summary
@@ -266,9 +459,16 @@ defmodule RateLtdTest do
       assert is_list(buckets)
       assert length(buckets) == bucket_count
       assert is_integer(total_usage) and total_usage >= 0
-      assert is_integer(active_queues) and active_queues >= 0
+      assert is_integer(total_pending) and total_pending >= 0
+      assert is_integer(local_pending) and local_pending >= 0
       assert is_float(avg_utilization) and avg_utilization >= 0.0
       assert is_float(peak_utilization) and peak_utilization >= 0.0
+
+      # Check that buckets include pending_messages field
+      Enum.each(buckets, fn bucket ->
+        assert Map.has_key?(bucket, :pending_messages)
+        assert is_integer(bucket.pending_messages)
+      end)
     end
 
     test "returns empty summary for non-existing group" do
@@ -279,10 +479,38 @@ defmodule RateLtdTest do
                bucket_count: 0,
                buckets: [],
                total_usage: 0,
-               active_queues: 0,
+               total_pending: 0,
+               local_pending: 0,
                avg_utilization: +0.0,
                peak_utilization: +0.0
              } = summary
+    end
+
+    test "correctly counts local pending messages" do
+      # Add some items to local queue for the group
+      config = %{max_queue_size: 10}
+
+      request1 = %{
+        "id" => "test-1",
+        "rate_limit_key" => "bucket:api:user1",
+        "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+        "queued_at" => System.system_time(:millisecond),
+        "expires_at" => System.system_time(:millisecond) + 30_000
+      }
+
+      request2 = %{
+        "id" => "test-2",
+        "rate_limit_key" => "bucket:api:user2",
+        "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+        "queued_at" => System.system_time(:millisecond),
+        "expires_at" => System.system_time(:millisecond) + 30_000
+      }
+
+      RateLtd.LocalQueue.enqueue(request1, config)
+      RateLtd.LocalQueue.enqueue(request2, config)
+
+      summary = RateLtd.get_group_summary("api")
+      assert summary.local_pending == 2
     end
   end
 
@@ -299,7 +527,7 @@ defmodule RateLtdTest do
     end
 
     test "normalizes tuple keys correctly" do
-      stats = RateLtd.get_bucket_stats({"api_key_123", "payment"})
+      stats = RateLtd.get_bucket_stats({"payment", "api_key_123"})
       assert stats.bucket_key == "bucket:payment:api_key_123"
     end
   end
@@ -312,13 +540,13 @@ defmodule RateLtdTest do
     end
 
     test "uses group config for grouped buckets" do
-      stats = RateLtd.get_bucket_stats({"regular_user", "api"})
+      stats = RateLtd.get_bucket_stats({"api", "regular_user"})
       # From group_configs
       assert stats.limit == 1000
     end
 
     test "uses api_key specific config when available" do
-      stats = RateLtd.get_bucket_stats({"premium_user", "api"})
+      stats = RateLtd.get_bucket_stats({"api", "premium_user"})
       # From api_key_configs
       assert stats.limit == 5000
     end
@@ -341,9 +569,11 @@ defmodule RateLtdTest do
         key => %{limit: 2, window_ms: 1000, max_queue_size: 100}
       })
 
-      # Use up the limit
-      assert {:allow, 1} = RateLtd.check(key)
-      assert {:allow, 0} = RateLtd.check(key)
+      # Use up the limit with actual requests
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
+
+      # Should be at limit now
       assert {:deny, _} = RateLtd.check(key)
 
       # Wait for window to slide
@@ -351,34 +581,85 @@ defmodule RateLtdTest do
 
       # Should be able to make requests again
       assert {:allow, _} = RateLtd.check(key)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request3" end)
     end
   end
 
-  describe "concurrent access" do
-    test "handles multiple processes accessing same key" do
+  describe "concurrent access with local queue" do
+    test "handles multiple processes accessing same key with queueing" do
       key = TestHelper.unique_key("concurrent")
 
-      # Configure larger limit for testing
+      # Configure small limit to force queueing
       Application.put_env(:rate_ltd, :configs, %{
-        key => %{limit: 20, window_ms: 60_000, max_queue_size: 100}
+        key => %{limit: 3, window_ms: 3000, max_queue_size: 10}
       })
 
       # Spawn multiple processes
       tasks =
-        Enum.map(1..10, fn i ->
+        Enum.map(1..8, fn i ->
           Task.async(fn ->
-            RateLtd.request(key, fn -> "result_#{i}" end)
+            RateLtd.request(
+              key,
+              fn ->
+                # Simulate some work
+                Process.sleep(100)
+                "result_#{i}"
+              end,
+              timeout_ms: 10_000
+            )
           end)
         end)
 
-      results = Task.await_many(tasks, 5000)
+      # Wait a bit for queuing to happen
+      Process.sleep(200)
 
-      # All should complete successfully (assuming sufficient limit)
-      assert length(results) == 10
+      # Check that some requests are queued
+      pending = RateLtd.LocalQueue.count_local_pending()
+      assert pending > 0
+
+      results = Task.await_many(tasks, 15_000)
+
+      # All should complete successfully
+      assert length(results) == 8
 
       Enum.each(results, fn result ->
         assert match?({:ok, _}, result)
       end)
+
+      # Queue should be empty after processing
+      assert RateLtd.LocalQueue.count_local_pending() == 0
+    end
+  end
+
+  describe "node isolation" do
+    test "local queue is isolated to current node" do
+      # This test verifies that the local queue only affects the current node
+      # In a real distributed test, you would verify across multiple nodes
+
+      config = %{max_queue_size: 5}
+
+      request = %{
+        "id" => "node-test",
+        "rate_limit_key" => "test:node:isolation",
+        "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+        "queued_at" => System.system_time(:millisecond),
+        "expires_at" => System.system_time(:millisecond) + 30_000
+      }
+
+      # Add to local queue
+      {:ok, _} = RateLtd.LocalQueue.enqueue(request, config)
+
+      # Verify it's in our local queue
+      assert RateLtd.LocalQueue.count_local_pending() == 1
+
+      # Verify it's tracked in Redis counters
+      pending_key = "rate_ltd:pending:test:node:isolation"
+      {:ok, count_str} = RateLtd.Redis.command(["GET", pending_key])
+      assert String.to_integer(count_str) == 1
+
+      # Clean up
+      {:ok, _} = RateLtd.LocalQueue.dequeue()
+      assert RateLtd.LocalQueue.count_local_pending() == 0
     end
   end
 end
