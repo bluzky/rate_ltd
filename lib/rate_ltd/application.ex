@@ -1,9 +1,11 @@
-# lib/rate_ltd/application.ex
 defmodule RateLtd.Application do
   use Application
 
   def start(_type, _args) do
     redis_config = Application.get_env(:rate_ltd, :redis, [])
+
+    # Initialize local queue ETS table
+    RateLtd.LocalQueue.init()
 
     children = [
       {RateLtd.Redis, redis_config},

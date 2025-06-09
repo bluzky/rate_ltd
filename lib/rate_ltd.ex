@@ -131,20 +131,18 @@ defmodule RateLtd do
   defp attempt_with_retries(_normalized_key, _function, 0), do: :rate_limited
 
   defp queue_and_wait(normalized_key, function, timeout_ms) do
-    queue_name = "#{normalized_key}:queue"
     config = RateLtd.ConfigManager.get_config(normalized_key)
     request_id = generate_id()
 
     request = %{
-      id: request_id,
-      queue_name: queue_name,
-      rate_limit_key: normalized_key,
-      caller_pid: :erlang.term_to_binary(self()) |> Base.encode64(),
-      queued_at: System.system_time(:millisecond),
-      expires_at: System.system_time(:millisecond) + timeout_ms
+      "id" => request_id,
+      "rate_limit_key" => normalized_key,
+      "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+      "queued_at" => System.system_time(:millisecond),
+      "expires_at" => System.system_time(:millisecond) + timeout_ms
     }
 
-    case RateLtd.Queue.enqueue(request, config) do
+    case RateLtd.LocalQueue.enqueue(request, config) do
       {:ok, _position} ->
         receive do
           {:rate_ltd_execute, ^request_id} ->

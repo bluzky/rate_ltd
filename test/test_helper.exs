@@ -13,7 +13,7 @@ Application.put_env(:rate_ltd, :redis,
 # Test helper functions
 defmodule RateLtd.TestHelper do
   @moduledoc """
-  Helper functions for RateLtd tests using real Redis.
+  Helper functions for RateLtd tests using real Redis with local queue support.
   """
 
   @doc """
@@ -24,6 +24,35 @@ defmodule RateLtd.TestHelper do
       {:ok, _} -> :ok
       # Ignore errors during cleanup
       {:error, _} -> :ok
+    end
+  end
+
+  @doc """
+  Clears the local ETS queue table.
+  """
+  def clear_local_queue do
+    try do
+      :ets.delete_all_objects(:rate_ltd_local_queue)
+    rescue
+      ArgumentError ->
+        # Table doesn't exist yet, create it
+        RateLtd.LocalQueue.init()
+    end
+  end
+
+  @doc """
+  Ensures local queue ETS table is initialized.
+  """
+  def setup_local_queue do
+    try do
+      # Check if table exists
+      :ets.info(:rate_ltd_local_queue)
+      :ok
+    rescue
+      ArgumentError ->
+        # Table doesn't exist, create it
+        RateLtd.LocalQueue.init()
+        :ok
     end
   end
 
@@ -114,52 +143,47 @@ defmodule RateLtd.TestHelper do
   end
 
   @doc """
-  Creates test queue data in Redis.
+  Sets up test pending counters in Redis for testing metrics.
   """
-  def setup_test_queues do
-    now = System.system_time(:millisecond)
+  def setup_test_pending_counters do
+    # Set some pending message counters
+    RateLtd.Redis.command(["SET", "rate_ltd:pending:bucket:api:user1", "3"])
+    RateLtd.Redis.command(["EXPIRE", "rate_ltd:pending:bucket:api:user1", 3600])
 
-    request1 =
-      %{
-        id: "queue_req_1",
-        queue_name: "test_queue",
-        rate_limit_key: "bucket:api:user1",
-        caller_pid: :erlang.term_to_binary(self()) |> Base.encode64(),
-        queued_at: now - 5000,
-        expires_at: now + 25000
-      }
-      |> Jason.encode!()
+    RateLtd.Redis.command(["SET", "rate_ltd:pending:bucket:api:user2", "1"])
+    RateLtd.Redis.command(["EXPIRE", "rate_ltd:pending:bucket:api:user2", 3600])
 
-    request2 =
-      %{
-        id: "queue_req_2",
-        queue_name: "test_queue",
-        rate_limit_key: "bucket:api:user1",
-        caller_pid: :erlang.term_to_binary(self()) |> Base.encode64(),
-        queued_at: now - 3000,
-        expires_at: now + 27000
-      }
-      |> Jason.encode!()
-
-    RateLtd.Redis.command(["RPUSH", "rate_ltd:queue:test_queue", request1, request2])
-    RateLtd.Redis.command(["EXPIRE", "rate_ltd:queue:test_queue", 3600])
+    RateLtd.Redis.command(["SET", "rate_ltd:pending:simple:test_key", "2"])
+    RateLtd.Redis.command(["EXPIRE", "rate_ltd:pending:simple:test_key", 3600])
   end
 
   @doc """
-  Builds a test request map with default values.
+  Creates test local queue entries for testing.
   """
-  def build_test_request(opts \\ []) do
+  def setup_test_local_queue do
+    setup_local_queue()
+
+    config = build_test_config()
     now = System.system_time(:millisecond)
 
-    %{
-      id: Keyword.get(opts, :id, "test_#{:rand.uniform(10000)}"),
-      queue_name: Keyword.get(opts, :queue_name, "test_queue"),
-      rate_limit_key: Keyword.get(opts, :rate_limit_key, "simple:test_key"),
-      caller_pid: :erlang.term_to_binary(self()) |> Base.encode64(),
-      queued_at: Keyword.get(opts, :queued_at, now),
-      expires_at: Keyword.get(opts, :expires_at, now + 30_000),
-      priority: Keyword.get(opts, :priority, 0)
+    request1 = %{
+      "id" => "local_queue_req_1",
+      "rate_limit_key" => "bucket:api:user1",
+      "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+      "queued_at" => now - 5000,
+      "expires_at" => now + 25000
     }
+
+    request2 = %{
+      "id" => "local_queue_req_2",
+      "rate_limit_key" => "bucket:api:user2",
+      "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+      "queued_at" => now - 3000,
+      "expires_at" => now + 27000
+    }
+
+    RateLtd.LocalQueue.enqueue(request1, config)
+    RateLtd.LocalQueue.enqueue(request2, config)
   end
 
   @doc """
@@ -211,6 +235,82 @@ defmodule RateLtd.TestHelper do
     end
   end
 
+  @doc """
+  Gets the pending message count from Redis for a specific rate limit key.
+  """
+  def get_redis_pending_count(rate_limit_key) do
+    pending_key = "rate_ltd:pending:#{rate_limit_key}"
+
+    case RateLtd.Redis.command(["GET", pending_key]) do
+      {:ok, nil} -> 0
+      {:ok, count_str} -> String.to_integer(count_str)
+      _ -> 0
+    end
+  end
+
+  @doc """
+  Gets the current count of items in the local queue.
+  """
+  def get_local_queue_count do
+    try do
+      RateLtd.LocalQueue.count_local_pending()
+    rescue
+      ArgumentError ->
+        # Table doesn't exist
+        0
+    end
+  end
+
+  @doc """
+  Counts Redis keys matching a pattern.
+  """
+  def count_redis_keys(pattern) do
+    case RateLtd.Redis.command(["KEYS", pattern]) do
+      {:ok, keys} -> length(keys)
+      _ -> 0
+    end
+  end
+
+  @doc """
+  Simulates expired request by creating one with past expiration.
+  """
+  def create_expired_request(rate_limit_key \\ "simple:expired_test") do
+    now = System.system_time(:millisecond)
+
+    %{
+      "id" => "expired_#{:rand.uniform(10000)}",
+      "rate_limit_key" => rate_limit_key,
+      "caller_pid" => :erlang.term_to_binary(self()) |> Base.encode64(),
+      "queued_at" => now - 35000,
+      # Already expired
+      "expires_at" => now - 5000
+    }
+  end
+
+  @doc """
+  Waits for the queue processor to process pending items.
+  """
+  def wait_for_queue_processing(timeout \\ 3000) do
+    initial_count = get_local_queue_count()
+
+    wait_until(
+      fn ->
+        get_local_queue_count() < initial_count
+      end,
+      timeout
+    )
+  end
+
+  @doc """
+  Verifies that Redis pending counters match expected values.
+  """
+  def verify_pending_counters(expected_counts) do
+    Enum.all?(expected_counts, fn {rate_limit_key, expected_count} ->
+      actual_count = get_redis_pending_count(rate_limit_key)
+      actual_count == expected_count
+    end)
+  end
+
   defp redis_host do
     Application.get_env(:rate_ltd, :redis)[:host]
   end
@@ -238,3 +338,9 @@ case RateLtd.Redis.start_link(Application.get_env(:rate_ltd, :redis)) do
     IO.puts("Please ensure Redis is running and accessible")
     System.halt(1)
 end
+
+# Clear any existing test data and initialize clean state
+RateLtd.TestHelper.clear_redis()
+RateLtd.TestHelper.clear_local_queue()
+
+IO.puts("✓ Test environment initialized with local queue support")
