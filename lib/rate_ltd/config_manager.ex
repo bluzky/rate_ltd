@@ -48,29 +48,28 @@ defmodule RateLtd.ConfigManager do
     get_simple_config(key)
   end
 
-  @spec get_grouped_config(String.t(), String.t()) :: config()
+  # Private functions
+
   defp get_grouped_config(group, api_key) do
-    defaults = get_defaults()
-    group_configs = get_group_configs()
-    api_key_configs = get_api_key_configs()
+    defaults = Application.get_env(:rate_ltd, :defaults, [])
+    group_configs = Application.get_env(:rate_ltd, :group_configs, %{})
+    api_key_configs = Application.get_env(:rate_ltd, :api_key_configs, %{})
 
     # Priority: api_key specific > group specific > defaults
-    api_key_config =
-      Map.get(api_key_configs, "#{group}:#{api_key}") || %{}
-
+    api_key_config = Map.get(api_key_configs, "#{group}:#{api_key}") || %{}
     group_config = Map.get(group_configs, group) || %{}
 
     config =
-      Map.merge(group_config, api_key_config)
+      group_config
+      |> Map.merge(api_key_config)
       |> normalize_config(defaults)
 
     Map.put(config, :bucket_type, :grouped)
   end
 
-  @spec get_simple_config(String.t()) :: config()
   defp get_simple_config(key) do
-    defaults = get_defaults()
-    simple_configs = get_simple_configs()
+    defaults = Application.get_env(:rate_ltd, :defaults, [])
+    simple_configs = Application.get_env(:rate_ltd, :configs, %{})
 
     config =
       case Map.get(simple_configs, key) do
@@ -81,7 +80,6 @@ defmodule RateLtd.ConfigManager do
     Map.put(config, :bucket_type, :simple)
   end
 
-  @spec build_default_config(keyword()) :: config()
   defp build_default_config(defaults) do
     %{
       limit: Keyword.get(defaults, :limit, 100),
@@ -90,7 +88,6 @@ defmodule RateLtd.ConfigManager do
     }
   end
 
-  @spec normalize_config(map() | {integer(), integer()}, keyword()) :: config()
   defp normalize_config(config, defaults) when is_map(config) do
     defaults_map = build_default_config(defaults)
     Map.merge(defaults_map, config)
@@ -102,23 +99,5 @@ defmodule RateLtd.ConfigManager do
       window_ms: window_ms,
       max_queue_size: Keyword.get(defaults, :max_queue_size, 1000)
     }
-  end
-
-  # Private helper functions for getting configuration values
-
-  defp get_defaults do
-    Application.get_env(:rate_ltd, :defaults, [])
-  end
-
-  defp get_group_configs do
-    Application.get_env(:rate_ltd, :group_configs, %{})
-  end
-
-  defp get_api_key_configs do
-    Application.get_env(:rate_ltd, :api_key_configs, %{})
-  end
-
-  defp get_simple_configs do
-    Application.get_env(:rate_ltd, :configs, %{})
   end
 end

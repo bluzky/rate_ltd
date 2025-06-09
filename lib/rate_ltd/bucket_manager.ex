@@ -6,22 +6,12 @@ defmodule RateLtd.BucketManager do
   Provides functionality to:
   - List all active buckets
   - Get group summaries and statistics
-  - Monitor bucket utilization
-  - Clean up expired buckets
   """
-
-  @type bucket_info :: %{
-          bucket_key: String.t(),
-          current_usage: non_neg_integer(),
-          limit: non_neg_integer(),
-          window_ms: non_neg_integer(),
-          utilization: float()
-        }
 
   @type group_summary :: %{
           group: String.t(),
           bucket_count: non_neg_integer(),
-          buckets: [bucket_info()],
+          buckets: [map()],
           total_usage: non_neg_integer(),
           active_queues: non_neg_integer(),
           avg_utilization: float(),
@@ -30,8 +20,8 @@ defmodule RateLtd.BucketManager do
 
   @spec list_active_buckets() :: [String.t()]
   def list_active_buckets do
-    bucket_keys = scan_keys("rate_ltd:bucket:*")
-    simple_keys = scan_keys("rate_ltd:simple:*")
+    bucket_keys = get_keys_by_pattern("rate_ltd:bucket:*")
+    simple_keys = get_keys_by_pattern("rate_ltd:simple:*")
 
     (bucket_keys ++ simple_keys)
     |> Enum.map(&extract_bucket_name/1)
@@ -75,115 +65,17 @@ defmodule RateLtd.BucketManager do
     end
   end
 
-  @spec get_all_groups() :: [String.t()]
-  def get_all_groups do
-    case redis_module().command(["KEYS", "rate_ltd:bucket:*"]) do
-      {:ok, keys} ->
-        keys
-        |> Enum.map(&extract_group_from_key/1)
-        |> Enum.reject(&is_nil/1)
-        |> Enum.uniq()
-
-      {:error, _} ->
-        []
-    end
-  end
-
-  @spec get_system_overview() :: map()
-  def get_system_overview do
-    groups = get_all_groups()
-    simple_buckets = get_simple_bucket_count()
-
-    group_summaries =
-      groups
-      |> Enum.map(&get_group_summary/1)
-      |> Enum.reject(&(&1.bucket_count == 0))
-
-    total_buckets =
-      Enum.reduce(group_summaries, simple_buckets, fn summary, acc ->
-        acc + summary.bucket_count
-      end)
-
-    total_usage =
-      Enum.reduce(group_summaries, 0, fn summary, acc ->
-        acc + summary.total_usage
-      end)
-
-    %{
-      total_buckets: total_buckets,
-      grouped_buckets: total_buckets - simple_buckets,
-      simple_buckets: simple_buckets,
-      total_usage: total_usage,
-      groups: group_summaries,
-      active_groups: length(group_summaries)
-    }
-  end
-
-  @spec cleanup_expired_buckets() :: {:ok, non_neg_integer()}
-  def cleanup_expired_buckets do
-    # This would typically be called by a background job
-    # Redis automatically expires keys, but we can help by cleaning up empty sorted sets
-
-    script = """
-    local keys = redis.call('KEYS', 'rate_ltd:*')
-    local cleaned = 0
-
-    for i = 1, #keys do
-      local key = keys[i]
-      if redis.call('TYPE', key).ok == 'zset' then
-        local count = redis.call('ZCARD', key)
-        if count == 0 then
-          redis.call('DEL', key)
-          cleaned = cleaned + 1
-        end
-      end
-    end
-
-    return cleaned
-    """
-
-    case redis_module().eval(script, [], []) do
-      {:ok, cleaned_count} -> {:ok, cleaned_count}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
   # Private functions
 
-  # Helper function to scan keys with pattern
-  defp scan_keys(pattern) do
-    scan_keys(pattern, "0", [])
-  end
-
-  defp scan_keys(pattern, cursor, acc) do
-    case redis_module().command(["SCAN", cursor, "MATCH", pattern, "COUNT", "100"]) do
-      {:ok, [next_cursor, keys]} ->
-        new_acc = acc ++ keys
-
-        if next_cursor == "0" do
-          # Scan complete
-          new_acc
-        else
-          # Continue scanning
-          scan_keys(pattern, next_cursor, new_acc)
-        end
-
-      {:error, _} ->
-        acc
+  defp get_keys_by_pattern(pattern) do
+    case redis_module().command(["KEYS", pattern]) do
+      {:ok, keys} -> keys
+      {:error, _} -> []
     end
   end
 
   defp extract_bucket_name("rate_ltd:" <> bucket_name), do: bucket_name
   defp extract_bucket_name(_), do: nil
-
-  defp extract_group_from_key("rate_ltd:bucket:" <> rest) do
-    case String.split(rest, ":", parts: 2) do
-      [group, _api_key] -> group
-      _ -> nil
-    end
-  end
-
-  defp extract_group_from_key(_), do: nil
 
   defp get_bucket_info(bucket_key) do
     redis_key = "rate_ltd:#{bucket_key}"
@@ -203,13 +95,6 @@ defmodule RateLtd.BucketManager do
 
       {:error, reason} ->
         {:error, reason}
-    end
-  end
-
-  defp get_simple_bucket_count do
-    case redis_module().command(["KEYS", "rate_ltd:simple:*"]) do
-      {:ok, keys} -> length(keys)
-      {:error, _} -> 0
     end
   end
 
