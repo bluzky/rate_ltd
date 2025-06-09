@@ -61,55 +61,6 @@ defmodule RateLtd.Queue do
     end
   end
 
-  @spec enqueue_batch([map()], map()) :: {:ok, [non_neg_integer()]} | {:error, atom()}
-  def enqueue_batch(requests, config) when is_list(requests) do
-    case requests do
-      [] ->
-        {:ok, []}
-
-      [first_request | _] ->
-        queue_key = "rate_ltd:queue:#{first_request.queue_name}"
-
-        request_data_list =
-          requests
-          |> Enum.map(fn request ->
-            request
-            |> Map.put_new(:priority, 0)
-            |> Jason.encode!()
-          end)
-
-        batch_script = """
-        local queue_key = KEYS[1]
-        local max_size = tonumber(ARGV[1])
-        local request_count = tonumber(ARGV[2])
-
-        local current_size = redis.call('LLEN', queue_key)
-
-        if current_size + request_count > max_size then
-          return {0, 'queue_full'}
-        end
-
-        local positions = {}
-        for i = 3, #ARGV do
-          local position = redis.call('RPUSH', queue_key, ARGV[i])
-          table.insert(positions, position)
-        end
-
-        redis.call('EXPIRE', queue_key, 3600)
-
-        return {1, positions}
-        """
-
-        argv = [config.max_queue_size, length(requests)] ++ request_data_list
-
-        case redis_module().eval(batch_script, [queue_key], argv) do
-          {:ok, [1, positions]} -> {:ok, positions}
-          {:ok, [0, _reason]} -> {:error, :queue_full}
-          {:error, reason} -> {:error, reason}
-        end
-    end
-  end
-
   @spec peek_next(String.t()) :: {:ok, map()} | {:empty} | {:error, term()}
   def peek_next(queue_name) do
     queue_key = "rate_ltd:queue:#{queue_name}"
@@ -121,32 +72,6 @@ defmodule RateLtd.Queue do
     end
   end
 
-  @spec peek_batch(String.t(), non_neg_integer()) :: {:ok, [map()]} | {:empty} | {:error, term()}
-  def peek_batch(queue_name, count) do
-    queue_key = "rate_ltd:queue:#{queue_name}"
-    end_index = -1
-    start_index = -count
-
-    case redis_module().command(["LRANGE", queue_key, start_index, end_index]) do
-      {:ok, []} ->
-        {:empty}
-
-      {:ok, data_list} ->
-        requests =
-          data_list
-          |> Enum.map(&decode_request/1)
-          |> Enum.filter(&match?({:ok, _}, &1))
-          |> Enum.map(fn {:ok, request} -> request end)
-          # Reverse to get proper queue order
-          |> Enum.reverse()
-
-        {:ok, requests}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
   @spec dequeue(String.t()) :: {:ok, map()} | {:empty} | {:error, term()}
   def dequeue(queue_name) do
     queue_key = "rate_ltd:queue:#{queue_name}"
@@ -155,47 +80,6 @@ defmodule RateLtd.Queue do
       {:ok, nil} -> {:empty}
       {:ok, data} -> decode_request(data)
       {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @spec dequeue_batch(String.t(), non_neg_integer()) ::
-          {:ok, [map()]} | {:empty} | {:error, term()}
-  def dequeue_batch(queue_name, count) do
-    queue_key = "rate_ltd:queue:#{queue_name}"
-
-    # Use pipeline to dequeue multiple items atomically
-    script = """
-    local queue_key = KEYS[1]
-    local count = tonumber(ARGV[1])
-
-    local items = {}
-    for i = 1, count do
-      local item = redis.call('RPOP', queue_key)
-      if item then
-        table.insert(items, item)
-      else
-        break
-      end
-    end
-
-    return items
-    """
-
-    case redis_module().eval(script, [queue_key], [count]) do
-      {:ok, []} ->
-        {:empty}
-
-      {:ok, data_list} ->
-        requests =
-          data_list
-          |> Enum.map(&decode_request/1)
-          |> Enum.filter(&match?({:ok, _}, &1))
-          |> Enum.map(fn {:ok, request} -> request end)
-
-        {:ok, requests}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 

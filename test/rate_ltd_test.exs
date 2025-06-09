@@ -280,8 +280,8 @@ defmodule RateLtdTest do
                buckets: [],
                total_usage: 0,
                active_queues: 0,
-               avg_utilization: 0.0,
-               peak_utilization: 0.0
+               avg_utilization: +0.0,
+               peak_utilization: +0.0
              } = summary
     end
   end

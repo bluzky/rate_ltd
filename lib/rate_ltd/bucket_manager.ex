@@ -148,52 +148,6 @@ defmodule RateLtd.BucketManager do
     end
   end
 
-  @spec get_bucket_details(String.t()) :: {:ok, map()} | {:error, term()}
-  def get_bucket_details(bucket_key) do
-    redis_key = "rate_ltd:#{bucket_key}"
-    config = RateLtd.ConfigManager.get_config(bucket_key)
-
-    # Get current usage and recent request timestamps
-    script = """
-    local key = ARGV[1]
-    local window_ms = tonumber(ARGV[2])
-    local now = tonumber(ARGV[3])
-
-    -- Clean expired entries first
-    local window_start = now - window_ms
-    redis.call('ZREMRANGEBYSCORE', key, '-inf', window_start)
-
-    -- Get current count and all timestamps
-    local count = redis.call('ZCARD', key)
-    local timestamps = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
-
-    return {count, timestamps}
-    """
-
-    now = System.system_time(:millisecond)
-
-    case redis_module().eval(script, [], [redis_key, config.window_ms, now]) do
-      {:ok, [count, timestamps]} ->
-        request_times = parse_timestamps(timestamps)
-
-        {:ok,
-         %{
-           bucket_key: bucket_key,
-           config: config,
-           current_usage: count,
-           remaining: max(0, config.limit - count),
-           utilization: if(config.limit > 0, do: count / config.limit * 100, else: 0),
-           window_start: now - config.window_ms,
-           window_end: now,
-           recent_requests: request_times,
-           next_reset: calculate_next_reset(request_times, config.window_ms, now)
-         }}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
   # Private functions
 
   # Helper function to scan keys with pattern
@@ -291,22 +245,6 @@ defmodule RateLtd.BucketManager do
       {:ok, keys} -> length(keys)
       {:error, _} -> 0
     end
-  end
-
-  defp parse_timestamps(timestamps) do
-    timestamps
-    |> Enum.chunk_every(2)
-    |> Enum.map(fn [_request_id, timestamp] ->
-      String.to_integer(timestamp)
-    end)
-    |> Enum.sort(:desc)
-  end
-
-  defp calculate_next_reset([], _window_ms, now), do: now
-
-  defp calculate_next_reset(request_times, window_ms, _now) do
-    oldest_request = Enum.min(request_times)
-    oldest_request + window_ms
   end
 
   defp redis_module do

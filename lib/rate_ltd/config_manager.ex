@@ -104,51 +104,6 @@ defmodule RateLtd.ConfigManager do
     }
   end
 
-  @spec validate_config(config()) :: :ok | {:error, String.t()}
-  def validate_config(config) do
-    cond do
-      not is_integer(config.limit) or config.limit < 0 ->
-        {:error, "limit must be a non-negative integer"}
-
-      not is_integer(config.window_ms) or config.window_ms <= 0 ->
-        {:error, "window_ms must be a positive integer"}
-
-      not is_integer(config.max_queue_size) or config.max_queue_size < 0 ->
-        {:error, "max_queue_size must be a non-negative integer"}
-
-      true ->
-        :ok
-    end
-  end
-
-  @spec get_config_source(String.t()) :: {:api_key | :group | :default, String.t()}
-  def get_config_source("bucket:" <> rest) do
-    [group, api_key] = String.split(rest, ":", parts: 2)
-    api_key_configs = get_api_key_configs()
-    group_configs = get_group_configs()
-
-    cond do
-      Map.has_key?(api_key_configs, "#{group}:#{api_key}") ->
-        {:api_key, "#{group}:#{api_key}"}
-
-      Map.has_key?(group_configs, group) ->
-        {:group, group}
-
-      true ->
-        {:default, "defaults"}
-    end
-  end
-
-  def get_config_source("simple:" <> key) do
-    simple_configs = get_simple_configs()
-
-    if Map.has_key?(simple_configs, key) do
-      {:simple, key}
-    else
-      {:default, "defaults"}
-    end
-  end
-
   # Private helper functions for getting configuration values
 
   defp get_defaults do
