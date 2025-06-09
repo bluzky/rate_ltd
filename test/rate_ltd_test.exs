@@ -49,7 +49,7 @@ defmodule RateLtdTest do
     end
 
     test "works with grouped bucket tuples" do
-      result = RateLtd.request({"premium_user", "api"}, fn -> "grouped success" end)
+      result = RateLtd.request({"api", "premium_user"}, fn -> "grouped success" end)
       assert {:ok, "grouped success"} = result
     end
 
@@ -227,21 +227,24 @@ defmodule RateLtdTest do
     end
 
     test "returns allow with remaining count for grouped bucket" do
-      result = RateLtd.check({"user123", "api"})
+      result = RateLtd.check({"api", "user123"})
       assert {:allow, remaining} = result
       assert is_integer(remaining) and remaining >= 0
     end
 
-    test "decreases remaining count with each check" do
-      key = TestHelper.unique_key("check_decrease")
+    test "does not consume quota when checking" do
+      key = TestHelper.unique_key("check_no_consume")
 
+      # Multiple checks should return the same remaining count
       {:allow, remaining1} = RateLtd.check(key)
       {:allow, remaining2} = RateLtd.check(key)
+      {:allow, remaining3} = RateLtd.check(key)
 
-      assert remaining2 == remaining1 - 1
+      assert remaining1 == remaining2
+      assert remaining2 == remaining3
     end
 
-    test "returns deny when limit exceeded" do
+    test "returns deny when limit already exceeded" do
       key = TestHelper.unique_key("check_limit")
 
       # Configure very low limit
@@ -249,12 +252,39 @@ defmodule RateLtdTest do
         key => %{limit: 1, window_ms: 60_000, max_queue_size: 100}
       })
 
-      # First check should allow
-      assert {:allow, 0} = RateLtd.check(key)
+      # Use up the limit with actual requests (not checks)
+      assert {:ok, _} = RateLtd.request(key, fn -> "consumed quota" end)
 
-      # Second check should deny
+      # Now check should deny since limit is exceeded
       assert {:deny, retry_after} = RateLtd.check(key)
       assert is_integer(retry_after) and retry_after > 0
+
+      # Multiple checks should still deny
+      assert {:deny, _} = RateLtd.check(key)
+      assert {:deny, _} = RateLtd.check(key)
+    end
+
+    test "returns correct remaining count after actual quota consumption" do
+      key = TestHelper.unique_key("check_after_request")
+
+      # Configure limit for testing
+      Application.put_env(:rate_ltd, :configs, %{
+        key => %{limit: 5, window_ms: 60_000, max_queue_size: 100}
+      })
+
+      # Initial check should show full limit
+      assert {:allow, 5} = RateLtd.check(key)
+
+      # Consume some quota with actual request
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
+
+      # Check should now show reduced remaining count
+      assert {:allow, 3} = RateLtd.check(key)
+
+      # Multiple checks should return same count
+      assert {:allow, 3} = RateLtd.check(key)
+      assert {:allow, 3} = RateLtd.check(key)
     end
   end
 
@@ -262,29 +292,44 @@ defmodule RateLtdTest do
     test "resets rate limit for simple key" do
       key = TestHelper.unique_key("reset_simple")
 
-      # Use up the limit
-      RateLtd.check(key)
-      RateLtd.check(key)
+      # Configure low limit for testing
+      Application.put_env(:rate_ltd, :configs, %{
+        key => %{limit: 2, window_ms: 60_000, max_queue_size: 100}
+      })
+
+      # Use up the limit with actual requests
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
+
+      # Should be at limit now
+      assert {:deny, _} = RateLtd.check(key)
 
       # Reset
       assert :ok = RateLtd.reset(key)
 
-      # Should be able to make requests again
-      assert {:allow, _} = RateLtd.check(key)
+      # Should be able to check and make requests again
+      assert {:allow, 2} = RateLtd.check(key)
+      assert {:ok, _} = RateLtd.request(key, fn -> "after reset" end)
     end
 
     test "resets rate limit for grouped bucket" do
-      # Use some of the limit
-      RateLtd.check({"user123", "api"})
-      RateLtd.check({"user123", "api"})
+      # Configure for testing
+      Application.put_env(:rate_ltd, :group_configs, %{
+        "api" => %{limit: 3, window_ms: 60_000, max_queue_size: 500}
+      })
+
+      # Use some of the limit with actual requests
+      assert {:ok, _} = RateLtd.request({"api", "user123"}, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request({"api", "user123"}, fn -> "request2" end)
+
+      # Check remaining should be 1
+      assert {:allow, 1} = RateLtd.check({"api", "user123"})
 
       # Reset
-      assert :ok = RateLtd.reset({"user123", "api"})
+      assert :ok = RateLtd.reset({"api", "user123"})
 
       # Should be back to full limit
-      {:allow, remaining} = RateLtd.check({"user123", "api"})
-      # 1000 - 1 (for the check we just made)
-      assert remaining == 999
+      assert {:allow, 3} = RateLtd.check({"api", "user123"})
     end
   end
 
@@ -293,7 +338,7 @@ defmodule RateLtdTest do
       key = TestHelper.unique_key("stats_simple")
 
       # Make a request to create the bucket
-      RateLtd.check(key)
+      assert {:ok, _} = RateLtd.request(key, fn -> "create bucket" end)
 
       stats = RateLtd.get_bucket_stats(key)
 
@@ -309,11 +354,14 @@ defmodule RateLtdTest do
     end
 
     test "returns stats for grouped bucket" do
-      stats = RateLtd.get_bucket_stats({"user123", "api"})
+      # Make a request to create the bucket
+      assert {:ok, _} = RateLtd.request({"api", "user123"}, fn -> "create bucket" end)
+
+      stats = RateLtd.get_bucket_stats({"api", "user123"})
 
       assert %{
                bucket_key: "bucket:api:user123",
-               original_key: {"user123", "api"},
+               original_key: {"api", "user123"},
                bucket_type: :grouped_bucket,
                limit: 1000,
                window_ms: 60_000
@@ -323,9 +371,9 @@ defmodule RateLtdTest do
     test "includes usage information" do
       key = TestHelper.unique_key("stats_usage")
 
-      # Make some requests
-      RateLtd.check(key)
-      RateLtd.check(key)
+      # Make some requests to consume quota
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
 
       stats = RateLtd.get_bucket_stats(key)
 
@@ -335,6 +383,28 @@ defmodule RateLtdTest do
       # 100 - 2
       assert remaining == 98
     end
+
+    test "check does not affect usage statistics" do
+      key = TestHelper.unique_key("stats_check_no_affect")
+
+      # Make one actual request
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+
+      # Get initial stats
+      stats1 = RateLtd.get_bucket_stats(key)
+      assert stats1.used == 1
+      assert stats1.remaining == 99
+
+      # Multiple checks should not change usage
+      RateLtd.check(key)
+      RateLtd.check(key)
+      RateLtd.check(key)
+
+      stats2 = RateLtd.get_bucket_stats(key)
+      assert stats2.used == 1
+      assert stats2.remaining == 99
+      assert stats1 == stats2
+    end
   end
 
   describe "list_active_buckets/0" do
@@ -342,10 +412,10 @@ defmodule RateLtdTest do
       key1 = TestHelper.unique_key("list_test1")
       key2 = TestHelper.unique_key("list_test2")
 
-      # Create some buckets by making requests
-      RateLtd.check(key1)
-      RateLtd.check({"user2", "api"})
-      RateLtd.check(key2)
+      # Create some buckets by making actual requests
+      assert {:ok, _} = RateLtd.request(key1, fn -> "create bucket1" end)
+      assert {:ok, _} = RateLtd.request({"api", "user2"}, fn -> "create bucket2" end)
+      assert {:ok, _} = RateLtd.request(key2, fn -> "create bucket3" end)
 
       buckets = RateLtd.list_active_buckets()
       assert is_list(buckets)
@@ -366,10 +436,10 @@ defmodule RateLtdTest do
 
   describe "get_group_summary/1" do
     test "returns summary for existing group with pending message counts" do
-      # Create some buckets in the group
-      RateLtd.check({"user1", "api"})
-      RateLtd.check({"user2", "api"})
-      RateLtd.check({"user3", "api"})
+      # Create some buckets in the group with actual requests
+      assert {:ok, _} = RateLtd.request({"api", "user1"}, fn -> "create bucket1" end)
+      assert {:ok, _} = RateLtd.request({"api", "user2"}, fn -> "create bucket2" end)
+      assert {:ok, _} = RateLtd.request({"api", "user3"}, fn -> "create bucket3" end)
 
       summary = RateLtd.get_group_summary("api")
 
@@ -457,7 +527,7 @@ defmodule RateLtdTest do
     end
 
     test "normalizes tuple keys correctly" do
-      stats = RateLtd.get_bucket_stats({"api_key_123", "payment"})
+      stats = RateLtd.get_bucket_stats({"payment", "api_key_123"})
       assert stats.bucket_key == "bucket:payment:api_key_123"
     end
   end
@@ -470,13 +540,13 @@ defmodule RateLtdTest do
     end
 
     test "uses group config for grouped buckets" do
-      stats = RateLtd.get_bucket_stats({"regular_user", "api"})
+      stats = RateLtd.get_bucket_stats({"api", "regular_user"})
       # From group_configs
       assert stats.limit == 1000
     end
 
     test "uses api_key specific config when available" do
-      stats = RateLtd.get_bucket_stats({"premium_user", "api"})
+      stats = RateLtd.get_bucket_stats({"api", "premium_user"})
       # From api_key_configs
       assert stats.limit == 5000
     end
@@ -499,9 +569,11 @@ defmodule RateLtdTest do
         key => %{limit: 2, window_ms: 1000, max_queue_size: 100}
       })
 
-      # Use up the limit
-      assert {:allow, 1} = RateLtd.check(key)
-      assert {:allow, 0} = RateLtd.check(key)
+      # Use up the limit with actual requests
+      assert {:ok, _} = RateLtd.request(key, fn -> "request1" end)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request2" end)
+
+      # Should be at limit now
       assert {:deny, _} = RateLtd.check(key)
 
       # Wait for window to slide
@@ -509,6 +581,7 @@ defmodule RateLtdTest do
 
       # Should be able to make requests again
       assert {:allow, _} = RateLtd.check(key)
+      assert {:ok, _} = RateLtd.request(key, fn -> "request3" end)
     end
   end
 
